@@ -567,6 +567,37 @@ class ReportTests(unittest.TestCase):
                     self.assertEqual(sum(w[key] for w in members), total[key])
                 self.assertEqual(sum(Decimal(w["cost"]) for w in members), Decimal(total["cost"]))
 
+    def test_tool_context_classification_scales_with_usage_not_tool_calls(self):
+        usage_count = 32
+        call_count = 64
+        rows = prefix() + [modern(response=f"r{i}", counts=usage(input=272000 + i % 2))
+                           for i in range(usage_count)]
+        rows += [record("response_item", {"type": "function_call", "call_id": f"c{i}"})
+                 for i in range(call_count)]
+        self.write(rows + [complete()])
+        with patch("harness_metrics.is_long_context", wraps=metrics.is_long_context) as classify:
+            report = self.report()
+        # Allow repeated summary passes, but never a usage scan for every call.
+        self.assertLessEqual(classify.call_count, usage_count * 6)
+        for group in [report, report["by_harness"]["codex"], report["by_mode"]["Normal"],
+                      report["by_tier"]["Medium"]]:
+            self.assertEqual(group["windows"][0]["total_tokens"], usage_count * 272100 + usage_count // 2)
+            self.assertEqual(group["windows"][0]["tool_calls"], call_count)
+            self.assertEqual(group["by_model"]["Mixed contexts (tools)"][0]["tool_calls"], call_count)
+            self.assertEqual(group["by_model"]["gpt-6.1-sol"][0]["tool_calls"], 0)
+            self.assertEqual(group["by_model"]["gpt-6.1-sol-long"][0]["tool_calls"], 0)
+
+    def test_usage_categories_are_not_rebuilt_for_each_window(self):
+        self.write(prefix() + [modern(counts=usage(write=100)), complete()])
+        with patch("harness_metrics.Usage.categories", autospec=True,
+                   side_effect=metrics.Usage.categories) as categorize:
+            report = self.report()
+        self.assertLessEqual(categorize.call_count, 3)
+        self.assertEqual({entry["name"]: entry["tokens"] for entry in report["windows"][0]["categories"]},
+                         {metrics.Category.INPUT.value: 500, metrics.Category.CACHE_READ.value: 400,
+                          metrics.Category.OUTPUT.value: 80, metrics.Category.REASONING.value: 20,
+                          metrics.Category.CACHE_WRITE.value: 100})
+
     def test_long_context_labels_follow_model_specific_prices_and_proxies(self):
         for model, input_tokens, long_context in [
             ("claude-sonnet-4-5", 200000, False), ("claude-sonnet-4-5", 200001, True),
@@ -1309,6 +1340,49 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(sum(w[key] for w in members), window[key])
             self.assertEqual(sum(Decimal(w["cost"]) for w in members), Decimal(window["cost"]))
         self.assertEqual(r["windows"][0]["conversations"], 3)
+
+    def test_report_aggregates_each_thread_once_and_preserves_combined_statistics(self):
+        rows = prefix(thread="same-id") + [modern(), complete()]
+        rows += [event("task_started", turn_id="t2"),
+                 event("thread_settings_applied", thread_settings={"service_tier": "priority"}),
+                 modern("t2", "r2", usage(input=300000, output=200))]
+        ending = complete("t2")
+        ending["payload"]["duration_ms"] = 20000
+        self.write(rows + [ending], "codex/session.jsonl")
+        claude = self.claude(output=700)
+        claude["message"]["model"] = "unpriced-model"
+        self.write([{"type": "user", "sessionId": "same-id", "uuid": "user1",
+                     "timestamp": START.isoformat()}, claude,
+                    {"type": "system", "subtype": "turn_duration", "durationMs": 5000,
+                     "timestamp": (START + timedelta(seconds=5)).isoformat()}], "claude/session.jsonl")
+        sources = {metrics.Harness.CLAUDE: [self.root / "claude"],
+                   metrics.Harness.OPENCODE: [self.opencode_db()],
+                   metrics.Harness.COPILOT: [self.root / "empty-copilot"]}
+        with patch("harness_metrics.add_thread", wraps=metrics.add_thread) as aggregate:
+            report = self.report(sources, self.catalog())
+        threads = {call.args[1].id: call.args[1] for call in aggregate.call_args_list}
+        self.assertEqual(len(threads), 3)
+        self.assertEqual(aggregate.call_count, len(threads))
+        expected = metrics.build_breakdown(threads.values(), NOW, self.catalog())
+        for key in expected:
+            self.assertEqual(report[key], expected[key], key)
+        for harness in [*sources, metrics.Harness.CODEX]:
+            expected_harness = metrics.build_breakdown(
+                [thread for thread in threads.values() if thread.harness == harness], NOW, self.catalog())
+            self.assertEqual(report["by_harness"][harness.value], expected_harness, harness)
+        self.assertEqual(report["windows"][0]["metrics"]["length"]["median"], 10)
+        self.assertEqual(report["windows"][0]["metrics"]["length"]["p95"], 30)
+        self.assertTrue(report["windows"][0]["partial_cost"])
+
+    def test_single_harness_report_aggregates_each_thread_once(self):
+        self.write(prefix() + [modern(), complete()], "codex/session.jsonl")
+        with patch("harness_metrics.add_thread", wraps=metrics.add_thread) as aggregate:
+            report = self.report({})
+        self.assertEqual(aggregate.call_count, 1)
+        expected = metrics.build_breakdown([aggregate.call_args.args[1]], NOW)
+        self.assertEqual(report["by_harness"]["codex"], expected)
+        for key in expected:
+            self.assertEqual(report[key], expected[key], key)
 
     def test_openrouter_per_token_rates_cache_hour_and_context_overrides(self):
         prices = self.catalog()

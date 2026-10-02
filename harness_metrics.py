@@ -1008,8 +1008,70 @@ class TierBreakdown:
     by_mode: dict[SpeedMode, ModeBreakdown] = field(default_factory=dict)
 
 
+@dataclass
+class Breakdown:
+    windows: list[Window]
+    by_model: dict[str, list[Window]] = field(default_factory=dict)
+    by_mode: dict[SpeedMode, ModeBreakdown] = field(default_factory=dict)
+    by_tier: dict[ModelTier, TierBreakdown] = field(default_factory=dict)
+
+
 def empty_windows(windows: list[Window]) -> list[Window]:
     return [Window(w.label, w.start, w.end, end_exclusive=w.end_exclusive) for w in windows]
+
+
+def empty_breakdown(windows: list[Window]) -> Breakdown:
+    return Breakdown(empty_windows(windows),
+                     by_mode={mode: ModeBreakdown(empty_windows(windows))
+                              for mode in (SpeedMode.NORMAL, SpeedMode.FAST)},
+                     by_tier={tier: TierBreakdown(empty_windows(windows))
+                              for tier in (ModelTier.BUDGET, ModelTier.MEDIUM, ModelTier.HIGH,
+                                           ModelTier.UNCLASSIFIED)})
+
+
+def merge_breakdown(target: Breakdown, source: Breakdown) -> None:
+    # Merge raw samples and per-conversation values before computing statistics.
+    def merge_windows(destination: list[Window], incoming: list[Window]) -> None:
+        for window, other in zip(destination, incoming):
+            window.conversations.update(other.conversations)
+            for conversation, duration in other.durations.items():
+                window.durations[conversation] = window.durations.get(conversation, 0) + duration
+            window.call_counts.update(other.call_counts)
+            window.ttft.extend(other.ttft)
+            window.throughput.extend(other.throughput)
+            window.tokens.update(other.tokens)
+            for category, cost in other.costs.items():
+                window.costs[category] += cost
+            window.unpriced.update(other.unpriced)
+            window.unpriced_categories.update(other.unpriced_categories)
+            window.models.update(other.models)
+            window.coverage.update(other.coverage)
+            for unit, amount in other.billing.items():
+                window.billing[unit] += amount
+
+    def merge_models(destination: dict[str, list[Window]], incoming: dict[str, list[Window]]) -> None:
+        for model, model_windows in incoming.items():
+            if model not in destination:
+                destination[model] = empty_windows(model_windows)
+            merge_windows(destination[model], model_windows)
+
+    def merge_modes(destination: dict[SpeedMode, ModeBreakdown],
+                    incoming: dict[SpeedMode, ModeBreakdown]) -> None:
+        for mode, group in incoming.items():
+            if mode not in destination:
+                destination[mode] = ModeBreakdown(empty_windows(group.windows))
+            merge_windows(destination[mode].windows, group.windows)
+            merge_models(destination[mode].by_model, group.by_model)
+
+    merge_windows(target.windows, source.windows)
+    merge_models(target.by_model, source.by_model)
+    merge_modes(target.by_mode, source.by_mode)
+    for tier, group in source.by_tier.items():
+        if tier not in target.by_tier:
+            target.by_tier[tier] = TierBreakdown(empty_windows(group.windows))
+        merge_windows(target.by_tier[tier].windows, group.windows)
+        merge_models(target.by_tier[tier].by_model, group.by_model)
+        merge_modes(target.by_tier[tier].by_mode, group.by_mode)
 
 
 def add_thread(windows: list[Window], thread: Thread,
@@ -1047,24 +1109,33 @@ def add_thread(windows: list[Window], thread: Thread,
                        mode_group.windows + mode_group.by_model[name])
         return result
 
+    # Classify usage once; tool calls in a turn share its model/mode contexts.
+    call_contexts_by_usage: dict[tuple[str, str | None, SpeedMode], set[bool]] = defaultdict(set)
     for turn in thread.turns.values():
         usage_events = turn.usage
+        usage_contexts: set[bool] = set()
         for record in usage_events:
             model = record.model or turn.model
             long_context = is_long_context(model, record.usage, catalog, record.aggregate)
+            usage_contexts.add(long_context)
+            call_contexts_by_usage[(turn.id, model, record.mode)].add(long_context)
+            counts = record.usage.categories()
+            usage_total = record.usage.total
             name = report_model(model, record.mode, long_context)
             costs, unpriced = price_usage(model, record.usage, record.mode, catalog,
                                           aggregate=record.aggregate)
             for window in targets(model, record.mode, model_tier(model), long_context):
                 if not window.contains(record.at):
                     continue
-                if record.usage.total:
+                if usage_total:
                     window.conversations.add(thread.id)
-                window.tokens.update(record.usage.categories())
-                window.models[name] += record.usage.total
+                for category, count in counts.items():
+                    window.tokens[category] += count
+                window.models[name] += usage_total
                 for category, cost in costs.items():
                     window.costs[category] += cost
-                window.unpriced_categories.update(unpriced)
+                for category, count in unpriced.items():
+                    window.unpriced_categories[category] += count
                 if unpriced:
                     window.unpriced[name] += sum(unpriced.values())
                 window.coverage["Usage responses"] += 1
@@ -1078,8 +1149,6 @@ def add_thread(windows: list[Window], thread: Thread,
                        next(iter(usage_modes)) if usage_modes else turn.mode)
         if timing_mode == SpeedMode.MIXED and len(usage_models) == 1:
             timing_model = "Mixed modes (timing)"
-        usage_contexts = {is_long_context(r.model or turn.model, r.usage, catalog, r.aggregate)
-                          for r in usage_events}
         if len(usage_contexts) > 1 and len(usage_models) == 1 and len(usage_modes) == 1:
             timing_model = "Mixed contexts (timing)"
         usage_tiers = {model_tier(r.model or turn.model) for r in usage_events}
@@ -1116,9 +1185,7 @@ def add_thread(windows: list[Window], thread: Thread,
     for call in thread.calls.values():
         turn = thread.turns.get(call.turn_id)
         model = call.model or (turn.model if turn else None)
-        call_contexts = {is_long_context(r.model or turn.model, r.usage, catalog, r.aggregate)
-                         for r in turn.usage
-                         if (r.model or turn.model) == model and r.mode == call.mode} if turn else set()
+        call_contexts = call_contexts_by_usage.get((turn.id, model, call.mode), set()) if turn else set()
         call_model = "Mixed contexts (tools)" if len(call_contexts) > 1 else model
         for window in targets(call_model, call.mode, model_tier(model), call_contexts == {True}):
             if window.contains(call.at):
@@ -1172,14 +1239,18 @@ def summarize(window: Window, report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
 def build_breakdown(threads: Iterable[Thread], now: datetime,
                     catalog: dict[str, Price] | None = None,
                     report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
-    windows = make_windows(now, report_zone)
-    by_model: dict[str, list[Window]] = {}
-    by_mode = {mode: ModeBreakdown(empty_windows(windows))
-               for mode in (SpeedMode.NORMAL, SpeedMode.FAST)}
-    by_tier = {tier: TierBreakdown(empty_windows(windows))
-               for tier in (ModelTier.BUDGET, ModelTier.MEDIUM, ModelTier.HIGH, ModelTier.UNCLASSIFIED)}
+    breakdown = empty_breakdown(make_windows(now, report_zone))
     for thread in threads:
-        add_thread(windows, thread, by_model, by_mode, by_tier, catalog)
+        add_thread(breakdown.windows, thread, breakdown.by_model, breakdown.by_mode,
+                   breakdown.by_tier, catalog)
+    return summarize_breakdown(breakdown, report_zone)
+
+
+def summarize_breakdown(breakdown: Breakdown, report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
+    windows = breakdown.windows
+    by_model = breakdown.by_model
+    by_mode = breakdown.by_mode
+    by_tier = breakdown.by_tier
     active_models = {name: ws for name, ws in sorted(by_model.items()) if any(w.conversations for w in ws)}
     tier_summaries: dict[str, Any] = {}
     for tier, group in by_tier.items():
@@ -1269,7 +1340,22 @@ def collect_report(root: Path, now: datetime | None = None, progress: bool = Fal
         all_paths.update(paths)
     for thread in threads:
         thread.id = f"{thread.harness.value}:{thread.id}"
-    report = build_breakdown(threads, now, catalog, report_zone)
+    windows = make_windows(now, report_zone)
+    overall = empty_breakdown(windows)
+    by_harness: dict[str, Any] = {}
+    for harness in sources:
+        harness_threads = [t for t in threads if t.harness == harness]
+        if progress and harness_threads:
+            print(f"Calculating {harness.value} summary…", file=sys.stderr)
+        breakdown = empty_breakdown(windows)
+        for thread in harness_threads:
+            add_thread(breakdown.windows, thread, breakdown.by_model, breakdown.by_mode,
+                       breakdown.by_tier, catalog)
+        merge_breakdown(overall, breakdown)
+        by_harness[harness.value] = summarize_breakdown(breakdown, report_zone)
+    if progress and threads:
+        print("Combining overall summary…", file=sys.stderr)
+    report = summarize_breakdown(overall, report_zone)
     report.update({"generated": now.astimezone(report_zone).isoformat(), "timezone": str(report_zone),
                    "source": str(root.resolve()), "sources": [str(p) for p in roots],
                    "files": len(all_paths), "threads": len(threads),
@@ -1279,7 +1365,7 @@ def collect_report(root: Path, now: datetime | None = None, progress: bool = Fal
                    "openrouter": catalog_metadata,
                    "price_proxies": PRICE_PROXIES, "fast_cost_multiplier": str(FAST_COST_MULTIPLIER),
                    "unknown_mode_assumption": SpeedMode.NORMAL.value,
-                   "by_harness": {h.value: build_breakdown([t for t in threads if t.harness == h], now, catalog, report_zone) for h in sources},
+                   "by_harness": by_harness,
                    "quality": dict(quality.counts), "warnings": quality.warnings})
     # Include only relevant matched catalog rows in the offline artifact.
     models = {report_model(record.model or turn.model, record.mode,
