@@ -35,6 +35,8 @@ Validate external fields before using them. Keep source storage read-only, retai
 
 For harness changes, include a minimal synthetic fixture representing the storage format. For pricing changes, record the authoritative source and verification date alongside the rates and test context thresholds, cache categories, and mode premiums where applicable. Update CLI help and the README when options or observable behavior change.
 
+`openrouter_prices.json` is the default supplemental pricing catalog and must be distributed alongside `harness_metrics.py`. To refresh it from a network with OpenRouter access, fetch `https://openrouter.ai/api/v1/models`, retain each valid model's `id` and complete `pricing` object (including cache rates and `overrides`), and record the URL as `source` and the UTC fetch time as `retrieved` beside the `data` array. Validate the replacement with `openrouter_prices()` and run the test suite. Keep embedded OpenAI and Anthropic rates authoritative for models they cover.
+
 No formatter, linter, or static type checker is configured. Follow nearby code and avoid unrelated formatting or refactoring.
 
 ## Test your change

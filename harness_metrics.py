@@ -8,8 +8,8 @@ With no directory, discovers installed harnesses; use --harness to select them.
 Codex discovery includes ~/.codex/sessions and ~/.codex/archived_sessions.
 An explicit directory reads only that Codex archive plus supplied source paths.
 Calendar windows use --timezone (Toronto by default, or UTC without timezone data).
-OpenRouter prices are fetched once when generating a report unless --offline
-or --openrouter-prices is supplied. Reports embed a snapshot and work offline.
+Pricing uses embedded rates and the bundled openrouter_prices.json by default.
+Use --live-prices to fetch OpenRouter rates. Reports embed prices and work offline.
 Local storage is read only; costs are API estimates, not subscription bills.
 """
 
@@ -60,6 +60,7 @@ PRICE_PROXIES = {"gpt-5.3-codex-spark": "gpt-5.4-mini", "codex-auto-review": "gp
 ANTHROPIC_PRICING_DATE = "2026-10-01"
 ANTHROPIC_PRICING_SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing"
 OPENROUTER_SOURCE = "https://openrouter.ai/api/v1/models"
+BUNDLED_OPENROUTER_PRICES = Path(__file__).resolve().with_name("openrouter_prices.json")
 
 
 class Harness(str, Enum):
@@ -1309,9 +1310,15 @@ def main() -> int:
     parser.add_argument("--claude-dir", type=Path, help="Claude projects directory (default: ~/.claude/projects)")
     parser.add_argument("--copilot-dir", type=Path, help="Copilot session-state directory (default: ~/.copilot/session-state)")
     parser.add_argument("--opencode-dir", type=Path, help="OpenCode data directory or opencode.db path")
-    parser.add_argument("--openrouter-prices", type=Path, help="saved /api/v1/models JSON catalog; avoids a network request")
-    parser.add_argument("--offline", action="store_true", help="skip live OpenRouter pricing; embedded/supplied prices still work")
+    pricing_options = parser.add_mutually_exclusive_group()
+    pricing_options.add_argument("--openrouter-prices", type=Path,
+                                 help="saved /api/v1/models JSON catalog (default: bundled openrouter_prices.json)")
+    pricing_options.add_argument("--live-prices", action="store_true",
+                                 help="fetch OpenRouter pricing; fall back to bundled prices if unavailable")
+    parser.add_argument("--offline", action="store_true", help="use local pricing only (the default); incompatible with --live-prices")
     args = parser.parse_args()
+    if args.offline and args.live_prices:
+        parser.error("--offline cannot be combined with --live-prices")
     root = args.directory if args.directory is not None else Path.cwd()
     if not root.is_dir():
         parser.error(f"not a directory: {root}")
@@ -1338,24 +1345,27 @@ def main() -> int:
         existing = [p for p in candidates if p.exists()]
         if existing:
             harness_roots[harness] = existing
-    catalog: dict[str, Price] = {}
-    catalog_metadata: dict[str, Any] | None = None
+    snapshot_path = args.openrouter_prices or BUNDLED_OPENROUTER_PRICES
     try:
-        if args.openrouter_prices:
-            catalog = openrouter_prices(json.loads(args.openrouter_prices.read_text(encoding="utf-8")))
-            catalog_metadata = {"source": OPENROUTER_SOURCE, "snapshot_file": str(args.openrouter_prices.resolve()),
-                                "retrieved": None}
-        elif harness_roots and not args.offline:
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        catalog = openrouter_prices(snapshot)
+        retrieved = snapshot.get("retrieved")
+        catalog_metadata: dict[str, Any] = {"source": OPENROUTER_SOURCE,
+                                           "snapshot_file": str(snapshot_path.resolve()),
+                                           "bundled": args.openrouter_prices is None,
+                                           "retrieved": retrieved if isinstance(retrieved, str) else None}
+    except (OSError, ValueError, UnicodeError) as error:
+        parser.error(f"unable to load OpenRouter catalog {snapshot_path}: {error}")
+    if args.live_prices:
+        try:
             print("Fetching OpenRouter model prices…", file=sys.stderr)
             request = Request(OPENROUTER_SOURCE, headers={"User-Agent": "coding-agent-metrics/1.0"})
             with urlopen(request, timeout=10) as response:
                 catalog = openrouter_prices(json.load(response))
             catalog_metadata = {"source": OPENROUTER_SOURCE, "retrieved": datetime.now(timezone.utc).isoformat()}
-    except (OSError, ValueError) as error:
-        if args.openrouter_prices:
-            parser.error(f"unable to load OpenRouter catalog: {error}")
-        print(f"OpenRouter prices unavailable: {error}; unmatched usage remains unpriced", file=sys.stderr)
-        catalog_metadata = {"source": OPENROUTER_SOURCE, "error": str(error), "retrieved": None}
+        except (OSError, ValueError, UnicodeError) as error:
+            print(f"Live OpenRouter prices unavailable: {error}; using bundled prices", file=sys.stderr)
+            catalog_metadata["error"] = str(error)
     try:
         codex_roots = [home / ".codex" / name for name in ("sessions", "archived_sessions")]
         report = collect_report(root, progress=True,
@@ -1472,7 +1482,7 @@ function tierOptions(){const select=$('tier-select');select.replaceChildren(text
 tierOptions();
 $('tier-select').addEventListener('change',()=>{selectedTier=$('tier-select').value;selectWindow(selected);});
 $('sources').append(document.createTextNode(`Rates verified ${data.pricing_date}: `));const link=text('a','OpenAI API pricing');link.href=data.pricing_source;link.rel='noreferrer';$('sources').append(link,document.createTextNode('. Rates are embedded in the script and are not updated automatically. Input directories: '+data.sources.join(', ')));
-const anthropicLink=text('a','Anthropic API pricing');anthropicLink.href=data.anthropic_pricing_source;anthropicLink.rel='noreferrer';$('sources').append(document.createTextNode(` · Anthropic verified ${data.anthropic_pricing_date}: `),anthropicLink);if(data.openrouter){const routerLink=text('a','OpenRouter model catalog');routerLink.href=data.openrouter.source;routerLink.rel='noreferrer';$('sources').append(document.createTextNode(' · '),routerLink,document.createTextNode(data.openrouter.error?` unavailable: ${data.openrouter.error}`:data.openrouter.retrieved?` retrieved ${fmtTime(data.openrouter.retrieved)}`:' · supplied snapshot (retrieval date unknown)'));}
+const anthropicLink=text('a','Anthropic API pricing');anthropicLink.href=data.anthropic_pricing_source;anthropicLink.rel='noreferrer';$('sources').append(document.createTextNode(` · Anthropic verified ${data.anthropic_pricing_date}: `),anthropicLink);if(data.openrouter){const routerLink=text('a','OpenRouter model catalog');routerLink.href=data.openrouter.source;routerLink.rel='noreferrer';const origin=data.openrouter.bundled?' · bundled snapshot':data.openrouter.snapshot_file?' · supplied snapshot':' · live catalog';const date=data.openrouter.retrieved?` retrieved ${fmtTime(data.openrouter.retrieved)}`:' (retrieval date unknown)';const error=data.openrouter.error?` · live fetch unavailable: ${data.openrouter.error}; using bundled prices`:'';$('sources').append(document.createTextNode(' · '),routerLink,document.createTextNode(origin+date+error));}
 $('sources').append(document.createTextNode(' · '));const modeLink=text('a','Fast mode documentation');modeLink.href='https://developers.openai.com/api/docs/guides/fast-mode';modeLink.rel='noreferrer';$('sources').append(modeLink);
 $('footer').textContent=`Report cutoff: ${fmtTime(data.generated)} (${data.timezone})`;
 for(const harness of Object.keys(data.by_harness)){const option=text('option',harness);option.value=harness;$('harness-select').append(option);}

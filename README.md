@@ -79,14 +79,23 @@ python3 harness_metrics.py --help
 | `--opencode-dir PATH` | OpenCode data directory or database file. |
 | `--output PATH` | HTML output; defaults to `harness_metrics.html`. The parent directory must exist. |
 | `--timezone NAME` | Timezone for calendar windows, such as `UTC` or `Europe/Paris`. |
-| `--offline` | Skip fetching OpenRouter prices. |
-| `--openrouter-prices PATH` | Load a saved OpenRouter `/api/v1/models` JSON response. |
+| `--offline` | Use local pricing only (the default); cannot be combined with `--live-prices`. |
+| `--openrouter-prices PATH` | Use a saved OpenRouter `/api/v1/models` JSON response instead of the bundled catalog. |
+| `--live-prices` | Fetch OpenRouter prices; use the bundled catalog if the request fails. |
 
 Quote paths containing spaces. For home-directory examples, use shell-expanded paths such as `"$HOME/.claude/projects"`.
 
 ## Pricing and network access
 
-Embedded OpenAI and Anthropic rates work offline. When non-Codex sources are included and neither `--offline` nor `--openrouter-prices` is supplied, the script fetches the public OpenRouter model catalog to price additional matched models. That request retrieves prices; it does not upload session logs.
+Report generation works without network access by default. OpenAI and Anthropic rates are embedded in the script, and [openrouter_prices.json](openrouter_prices.json) supplies additional model prices from the [public OpenRouter catalog](https://openrouter.ai/api/v1/models). The bundled file records its source and retrieval timestamp and preserves cache rates and context overrides. Keep it alongside `harness_metrics.py` when copying or packaging the tool; it is located relative to the script, regardless of the working directory.
+
+To explicitly fetch live prices:
+
+```sh
+python3 harness_metrics.py --live-prices --output report.html
+```
+
+This request retrieves prices without uploading session logs. A failed request uses the bundled prices and records the error in the report. Live pricing cannot be combined with `--offline` or `--openrouter-prices`.
 
 To use a saved catalog:
 
@@ -94,7 +103,7 @@ To use a saved catalog:
 python3 harness_metrics.py --openrouter-prices /path/to/models.json --output report.html
 ```
 
-The JSON must contain the catalog's `data` array. A supplied catalog can also be used with `--offline`. A failed live fetch still produces a report; an invalid supplied catalog stops generation.
+The JSON must contain the catalog's `data` array with valid model prices. A supplied catalog can also be used with `--offline`. A missing or invalid local catalog stops generation with its path in the error message. Prices are snapshots and are not updated automatically; the report shows the catalog's retrieval timestamp when available.
 
 Costs are **API-equivalent estimates, not subscription bills**. Embedded rates are snapshots applied to historical usage, and some models use documented proxies. OpenRouter prices supplement models without embedded rates. Unpriced tokens remain in usage totals and make the cost estimate partial. Recorded billing measurements appear separately.
 

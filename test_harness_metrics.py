@@ -1324,14 +1324,118 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(next(w for w in report["windows"] if w["label"] == "Last 7 days")["total_tokens"], 800)
 
     def test_cli_openrouter_failure_retains_report_and_error(self):
-        db = self.opencode_db(model="unknown-model", provider="test")
+        db = self.opencode_db(model="gemini-2.5-pro", provider="google")
         output = self.root / "report.html"
-        with patch("sys.argv", ["harness_metrics.py", str(self.root), "--harness", "opencode", "--opencode-dir", str(db), "--output", str(output)]), \
+        with patch("sys.argv", ["harness_metrics.py", str(self.root), "--harness", "opencode", "--opencode-dir", str(db), "--live-prices", "--output", str(output)]), \
              patch("harness_metrics.urlopen", side_effect=OSError("offline")), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(metrics.main(), 0)
         report = json.loads(output.read_text().split('id="report-data">')[1].split('</script>')[0])
         self.assertEqual(report["openrouter"]["error"], "offline")
-        self.assertTrue(next(w for w in report["windows"] if w["label"] == "Last 7 days")["partial_cost"])
+        self.assertTrue(report["openrouter"]["bundled"])
+        window = next(w for w in report["windows"] if w["label"] == "Last 7 days")
+        self.assertFalse(window["partial_cost"])
+        self.assertEqual(Decimal(window["cost"]), Decimal(".00125"))
+
+    def test_bundled_catalog_preserves_cache_and_context_rates(self):
+        snapshot = json.loads(metrics.BUNDLED_OPENROUTER_PRICES.read_text(encoding="utf-8"))
+        catalog = metrics.openrouter_prices(snapshot)
+        self.assertEqual(snapshot["source"], metrics.OPENROUTER_SOURCE)
+        self.assertIsNotNone(datetime.fromisoformat(snapshot["retrieved"]).tzinfo)
+        self.assertEqual(len(catalog), len(snapshot["data"]))
+        price = catalog["google/gemini-2.5-pro"]
+        self.assertEqual(price.short.cached, Decimal(".125"))
+        self.assertEqual(price.short.write, Decimal(".375"))
+        for count, input_rate in [(199999, "1.25"), (200000, "2.5")]:
+            with self.subTest(input_tokens=count):
+                costs, missing = metrics.price_usage("gemini-2.5-pro", metrics.Usage(count, 0), catalog=catalog)
+                self.assertEqual(costs[metrics.Category.INPUT], Decimal(count) * Decimal(input_rate) / metrics.MILLION)
+                self.assertFalse(missing)
+        embedded = metrics.model_price("gpt-6.1-sol", catalog)
+        self.assertEqual(embedded, metrics.PRICES["gpt-6.1-sol"])
+
+    def test_cli_defaults_to_bundled_prices_from_another_working_directory(self):
+        db = self.opencode_db(model="gemini-2.5-pro", provider="google")
+        output = self.root / "report.html"
+        original = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, original)
+        for options in [[], ["--offline"]]:
+            with self.subTest(options=options), \
+                 patch("sys.argv", ["harness_metrics.py", str(self.root), "--harness", "opencode", "--opencode-dir", str(db), "--output", str(output), *options]), \
+                 patch("harness_metrics.urlopen") as request, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(metrics.main(), 0)
+                request.assert_not_called()
+            report = json.loads(output.read_text().split('id="report-data">')[1].split('</script>')[0])
+            self.assertTrue(report["openrouter"]["bundled"])
+            self.assertEqual(report["openrouter"]["snapshot_file"], str(metrics.BUNDLED_OPENROUTER_PRICES))
+            self.assertIsNotNone(report["openrouter"]["retrieved"])
+            window = next(w for w in report["windows"] if w["label"] == "Last 7 days")
+            self.assertEqual(window["total_tokens"], 800)
+            self.assertEqual(Decimal(window["cost"]), Decimal(".00125"))
+            self.assertFalse(window["partial_cost"])
+
+    def test_cli_supplied_and_live_catalogs_replace_bundled_prices(self):
+        snapshot = {"data": [{"id": "vendor/new-model", "pricing": {
+            "prompt": ".000002", "completion": ".000010", "input_cache_read": ".0000002",
+            "input_cache_write": ".0000025"}}]}
+        path = self.root / "prices.json"
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        db = self.opencode_db(model="vendor/new-model", provider="openrouter")
+        output = self.root / "report.html"
+        for options in [["--openrouter-prices", str(path), "--offline"], ["--live-prices"]]:
+            with self.subTest(options=options), \
+                 patch("sys.argv", ["harness_metrics.py", str(self.root), "--harness", "opencode", "--opencode-dir", str(db), "--output", str(output), *options]), \
+                 patch("harness_metrics.urlopen", return_value=io.StringIO(json.dumps(snapshot))) as request, \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(metrics.main(), 0)
+                if "--live-prices" in options:
+                    request.assert_called_once()
+                else:
+                    request.assert_not_called()
+            report = json.loads(output.read_text().split('id="report-data">')[1].split('</script>')[0])
+            self.assertFalse(report["openrouter"].get("bundled", False))
+            window = next(w for w in report["windows"] if w["label"] == "Last 7 days")
+            self.assertFalse(window["partial_cost"])
+            self.assertEqual(Decimal(window["cost"]), Decimal(".00178"))
+
+    def test_cli_invalid_live_catalog_falls_back_to_bundle(self):
+        output = self.root / "report.html"
+        with patch("sys.argv", ["harness_metrics.py", str(self.root), "--live-prices", "--output", str(output)]), \
+             patch("harness_metrics.urlopen", return_value=io.StringIO('{"data": []}')), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(metrics.main(), 0)
+        report = json.loads(output.read_text().split('id="report-data">')[1].split('</script>')[0])
+        self.assertTrue(report["openrouter"]["bundled"])
+        self.assertIn("no valid model prices", report["openrouter"]["error"])
+
+    def test_cli_missing_or_invalid_local_catalog_stops_without_network(self):
+        path = self.root / "prices.json"
+        output = self.root / "report.html"
+        for contents in [None, "{invalid", '{"data": []}', '{"data": {}}']:
+            if contents is not None:
+                path.write_text(contents, encoding="utf-8")
+            for supplied in [False, True]:
+                options = ["--openrouter-prices", str(path)] if supplied else []
+                with self.subTest(contents=contents, supplied=supplied), \
+                     patch("harness_metrics.BUNDLED_OPENROUTER_PRICES", path), \
+                     patch("sys.argv", ["harness_metrics.py", str(self.root), "--output", str(output), *options]), \
+                     patch("harness_metrics.urlopen") as request, redirect_stderr(io.StringIO()) as errors, \
+                     self.assertRaises(SystemExit) as stopped:
+                    metrics.main()
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertIn(str(path), errors.getvalue())
+                request.assert_not_called()
+                self.assertFalse(output.exists())
+
+    def test_cli_live_pricing_rejects_conflicting_options(self):
+        for options in [["--offline"], ["--openrouter-prices", "prices.json"]]:
+            with self.subTest(options=options), \
+                 patch("sys.argv", ["harness_metrics.py", "--live-prices", *options]), \
+                 patch("harness_metrics.urlopen") as request, redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit) as stopped:
+                metrics.main()
+            self.assertEqual(stopped.exception.code, 2)
+            request.assert_not_called()
 
     def test_cli_missing_default_copilot_directory_is_not_an_error(self):
         output = self.root / "report.html"
