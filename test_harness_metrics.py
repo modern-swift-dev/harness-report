@@ -476,6 +476,19 @@ class ReportTests(unittest.TestCase):
         costs, missing = metrics.price_usage("gpt-5.5", u)
         self.assertEqual(missing, {metrics.Category.CACHE_WRITE: 100})
 
+    def test_token_summary_includes_cache_writes_and_reasoning_without_double_counting(self):
+        self.write(prefix() + [modern(counts=usage(input=1000, output=100, cached=400, reasoning=20, write=100)), complete()])
+        report = self.report()
+        groups = [report, report["by_harness"]["codex"],
+                  {"windows": report["by_model"]["gpt-6.1-sol"]},
+                  report["by_mode"]["Normal"], report["by_tier"]["Medium"]]
+        for group in groups:
+            for window in group["windows"]:
+                with self.subTest(label=window["label"], tokens=window["total_tokens"]):
+                    expected = (1000, 100, 400) if window["total_tokens"] else (0, 0, 0)
+                    self.assertEqual((window["input_tokens"], window["output_tokens"], window["cached_input_tokens"]), expected)
+                    self.assertEqual(window["total_tokens"], window["input_tokens"] + window["output_tokens"])
+
     def test_long_model_entries_separate_context_and_fast_activity(self):
         for legacy_usage in (False, True):
             with self.subTest(legacy_usage=legacy_usage):
@@ -575,9 +588,17 @@ class ReportTests(unittest.TestCase):
         report = metrics.build_breakdown([metrics.Thread("aggregate", turns={turn.id: turn})], NOW)
         self.assertEqual(set(report["by_model"]), {"gpt-6.1-sol"})
         window = report["by_model"]["gpt-6.1-sol"][0]
-        self.assertTrue(window["partial_cost"])
-        self.assertEqual(window["unpriced"], {"gpt-6.1-sol": 300100})
+        self.assertFalse(window["partial_cost"])
+        self.assertEqual(window["unpriced"], {})
+        self.assertEqual(Decimal(window["cost"]), Decimal(".601"))
         self.assertEqual(window["coverage"]["Aggregate snapshots"], 1)
+
+    def test_aggregate_base_context_rates_preserve_recorded_speed_premium(self):
+        for mode, expected in [(metrics.SpeedMode.NORMAL, ".601"), (metrics.SpeedMode.FAST, ".9015")]:
+            with self.subTest(mode=mode):
+                costs, missing = metrics.price_usage("gpt-6.1-sol", metrics.Usage(300000, 100), mode, aggregate=True)
+                self.assertEqual(sum(costs.values()), Decimal(expected))
+                self.assertFalse(missing)
 
     def test_malformed_and_invalid_usage(self):
         self.write(prefix() + ['{bad-json', '[]', modern(counts=usage(cached=2000)),
@@ -1236,6 +1257,29 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(Decimal(r["windows"][0]["cost"]), Decimal(".00448"))
         self.assertEqual(r["windows"][0]["coverage"]["Aggregate snapshots"], 1)
 
+    def test_copilot_large_shutdown_totals_use_normal_context_rates(self):
+        for has_detailed_usage, expected in [(False, ".7506"), (True, "1.0012")]:
+            with self.subTest(has_detailed_usage=has_detailed_usage):
+                rows = []
+                if has_detailed_usage:
+                    rows.append(self.copilot("assistant.usage", "usage", {
+                        "model": "gpt-5.4", "inputTokens": 100000, "outputTokens": 100,
+                        "cacheReadTokens": 400, "reasoningTokens": 20}))
+                rows.append(self.copilot("session.shutdown", "shutdown", {"modelMetrics": {
+                    "gpt-5.4": {"usage": {"inputTokens": 400000 if has_detailed_usage else 300000,
+                        "outputTokens": 200 if has_detailed_usage else 100,
+                        "cacheReadTokens": 800 if has_detailed_usage else 400,
+                        "reasoningTokens": 40 if has_detailed_usage else 20}}}}))
+                self.write(rows, "copilot/events.jsonl")
+                report = self.report({metrics.Harness.COPILOT: [self.root / "copilot"]})
+                window = report["windows"][0]
+                self.assertFalse(window["partial_cost"])
+                self.assertEqual(window["unpriced"], {})
+                self.assertEqual(Decimal(window["cost"]), Decimal(expected))
+                self.assertEqual(window["total_tokens"], 400200 if has_detailed_usage else 300100)
+                self.assertEqual(window["coverage"]["Aggregate snapshots"], 1)
+                self.assertEqual(set(report["by_model"]), {"gpt-5.4"})
+
     def test_opencode_normalizes_disjoint_categories_and_preserves_recorded_cost(self):
         db = self.opencode_db()
         before = db.read_bytes()
@@ -1301,8 +1345,8 @@ class HarnessTests(unittest.TestCase):
                     self.assertEqual(window["unpriced"], {name: count + 100} if missing else {})
         self.assertFalse(metrics.is_long_context("vendor/new-model", metrics.Usage(2000, 0), prices, aggregate=True))
         costs, missing = metrics.price_usage("vendor/new-model", metrics.Usage(2000, 0), catalog=prices, aggregate=True)
-        self.assertEqual(sum(costs.values(), Decimal(0)), 0)
-        self.assertEqual(sum(missing.values()), 2000)
+        self.assertEqual(sum(costs.values(), Decimal(0)), Decimal(".004"))
+        self.assertFalse(missing)
 
     def test_claude_fast_is_not_charged_codex_multiplier(self):
         normal, _ = metrics.price_usage("claude-opus-5-5", metrics.Usage(100, 10))
