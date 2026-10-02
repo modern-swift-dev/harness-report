@@ -125,6 +125,18 @@ def recorded_mode(settings: dict[str, Any], fallback: SpeedMode = SpeedMode.NORM
     return SpeedMode.OTHER
 
 
+def report_model(model: str | None, mode: SpeedMode, long_context: bool = False) -> str:
+    name = model or "Unknown model"
+    if name in {"Mixed models (timing)", "Mixed modes (timing)",
+                "Mixed contexts (timing)", "Mixed contexts (tools)"}:
+        return name
+    if mode == SpeedMode.FAST:
+        name += "-fast"
+    if long_context:
+        name += "-long"
+    return name
+
+
 @dataclass(frozen=True)
 class Rates:
     input: Decimal
@@ -141,6 +153,10 @@ class Price:
     threshold: int = 272_000
     fast_multiplier: Decimal | None = FAST_COST_MULTIPLIER
     context_rates: tuple[tuple[int, Rates], ...] = ()
+
+    def is_long_context(self, input_tokens: int) -> bool:
+        return (self.long is not None and input_tokens > self.threshold or
+                any(input_tokens >= minimum for minimum, _ in self.context_rates))
 
 
 def rates(input: str, cached: str | None, output: str, write: str | None = None) -> Rates:
@@ -330,17 +346,27 @@ def usage_delta(current: Usage, previous: Usage) -> tuple[Usage, bool]:
                  max(0, current.write - previous.write)), False
 
 
-def price_usage(model: str | None, usage: Usage, mode: SpeedMode = SpeedMode.NORMAL,
-                catalog: dict[str, Price] | None = None,
-                aggregate: bool = False) -> tuple[dict[Category, Decimal], dict[Category, int]]:
-    counts = usage.categories()
+def model_price(model: str | None, catalog: dict[str, Price] | None = None) -> Price | None:
     price = PRICES.get(pricing_model(model))
     router_id = router_model(model, catalog or {}) if catalog and price is None else None
     if router_id:
         price = (catalog or {})[router_id]
+    return price
+
+
+def is_long_context(model: str | None, usage: Usage,
+                    catalog: dict[str, Price] | None = None, aggregate: bool = False) -> bool:
+    price = model_price(model, catalog)
+    return not aggregate and price is not None and price.is_long_context(usage.input)
+
+
+def price_usage(model: str | None, usage: Usage, mode: SpeedMode = SpeedMode.NORMAL,
+                catalog: dict[str, Price] | None = None,
+                aggregate: bool = False) -> tuple[dict[Category, Decimal], dict[Category, int]]:
+    counts = usage.categories()
+    price = model_price(model, catalog)
     # A session aggregate cannot establish per-request long-context pricing.
-    if aggregate and price and (price.long and usage.input > price.threshold or
-                                any(usage.input >= minimum for minimum, _ in price.context_rates)):
+    if aggregate and price and price.is_long_context(usage.input):
         price = None
     multiplier = (price.fast_multiplier if price else None) if mode == SpeedMode.FAST else Decimal(1)
     selected = (price.long if price.long and usage.input > price.threshold else price.short) if price else None
@@ -990,9 +1016,10 @@ def add_thread(windows: list[Window], thread: Thread,
                by_mode: dict[SpeedMode, ModeBreakdown] | None = None,
                by_tier: dict[ModelTier, TierBreakdown] | None = None,
                catalog: dict[str, Price] | None = None) -> None:
-    def targets(model: str | None, mode: SpeedMode, tier: ModelTier) -> list[Window]:
+    def targets(model: str | None, mode: SpeedMode, tier: ModelTier,
+                long_context: bool = False) -> list[Window]:
         result = list(windows)
-        name = model or "Unknown model"
+        name = report_model(model, mode, long_context)
         if by_model is not None:
             if name not in by_model:
                 by_model[name] = empty_windows(windows)
@@ -1023,20 +1050,22 @@ def add_thread(windows: list[Window], thread: Thread,
         usage_events = turn.usage
         for record in usage_events:
             model = record.model or turn.model
+            long_context = is_long_context(model, record.usage, catalog, record.aggregate)
+            name = report_model(model, record.mode, long_context)
             costs, unpriced = price_usage(model, record.usage, record.mode, catalog,
                                           aggregate=record.aggregate)
-            for window in targets(model, record.mode, model_tier(model)):
+            for window in targets(model, record.mode, model_tier(model), long_context):
                 if not window.contains(record.at):
                     continue
                 if record.usage.total:
                     window.conversations.add(thread.id)
                 window.tokens.update(record.usage.categories())
-                window.models[record.model or turn.model or "Unknown model"] += record.usage.total
+                window.models[name] += record.usage.total
                 for category, cost in costs.items():
                     window.costs[category] += cost
                 window.unpriced_categories.update(unpriced)
                 if unpriced:
-                    window.unpriced[record.model or turn.model or "Unknown model"] += sum(unpriced.values())
+                    window.unpriced[name] += sum(unpriced.values())
                 window.coverage["Usage responses"] += 1
                 if record.aggregate:
                     window.coverage["Aggregate snapshots"] += 1
@@ -1046,10 +1075,16 @@ def add_thread(windows: list[Window], thread: Thread,
         usage_modes = {r.mode for r in usage_events}
         timing_mode = (SpeedMode.MIXED if len(usage_modes) > 1 else
                        next(iter(usage_modes)) if usage_modes else turn.mode)
+        if timing_mode == SpeedMode.MIXED and len(usage_models) == 1:
+            timing_model = "Mixed modes (timing)"
+        usage_contexts = {is_long_context(r.model or turn.model, r.usage, catalog, r.aggregate)
+                          for r in usage_events}
+        if len(usage_contexts) > 1 and len(usage_models) == 1 and len(usage_modes) == 1:
+            timing_model = "Mixed contexts (timing)"
         usage_tiers = {model_tier(r.model or turn.model) for r in usage_events}
         timing_tier = (ModelTier.MIXED if len(usage_tiers) > 1 else
                        next(iter(usage_tiers)) if usage_tiers else model_tier(turn.model))
-        turn_windows = targets(timing_model, timing_mode, timing_tier)
+        turn_windows = targets(timing_model, timing_mode, timing_tier, usage_contexts == {True})
         for window in turn_windows:
             if turn.start and window.contains(turn.start):
                 window.conversations.add(thread.id)
@@ -1080,7 +1115,11 @@ def add_thread(windows: list[Window], thread: Thread,
     for call in thread.calls.values():
         turn = thread.turns.get(call.turn_id)
         model = call.model or (turn.model if turn else None)
-        for window in targets(model, call.mode, model_tier(model)):
+        call_contexts = {is_long_context(r.model or turn.model, r.usage, catalog, r.aggregate)
+                         for r in turn.usage
+                         if (r.model or turn.model) == model and r.mode == call.mode} if turn else set()
+        call_model = "Mixed contexts (tools)" if len(call_contexts) > 1 else model
+        for window in targets(call_model, call.mode, model_tier(model), call_contexts == {True}):
             if window.contains(call.at):
                 window.conversations.add(thread.id)
                 window.call_counts[thread.id] += 1
@@ -1239,7 +1278,12 @@ def collect_report(root: Path, now: datetime | None = None, progress: bool = Fal
                    "by_harness": {h.value: build_breakdown([t for t in threads if t.harness == h], now, catalog, report_zone) for h in sources},
                    "quality": dict(quality.counts), "warnings": quality.warnings})
     # Include only relevant matched catalog rows in the offline artifact.
-    matches = {model: router_model(model, catalog or {}) for model in report["by_model"]}
+    models = {report_model(record.model or turn.model, record.mode,
+                           is_long_context(record.model or turn.model, record.usage, catalog, record.aggregate)):
+              record.model or turn.model
+              for thread in threads for turn in thread.turns.values() for record in turn.usage}
+    matches = {name: router_model(model, catalog or {}) for name, model in models.items()
+               if name in report["by_model"]}
     report["openrouter_rates"] = {model: {"id": identifier, "input": str(catalog[identifier].short.input),
                                         "cached": str(catalog[identifier].short.cached) if catalog[identifier].short.cached is not None else None,
                                         "output": str(catalog[identifier].short.output)}
@@ -1352,10 +1396,9 @@ HTML = r'''<!doctype html>
 <section class="grid" id="performance" aria-label="Performance charts"></section>
 <div class="section-head"><h2>Tokens &amp; estimated cost</h2><p>Selected window · USD · API-equivalent token estimates</p></div>
 <section class="grid" id="breakdowns" aria-label="Token and cost breakdowns"></section>
-<div class="section-head comparison-controls"><div><h2>Compare tiers, models &amp; modes</h2><p>One value per metric · conversations, tokens and costs are totals</p></div><label class="model-filter" for="comparison-stat-select">Metric statistic <select id="comparison-stat-select"></select></label></div>
+<div class="section-head comparison-controls"><div><h2>Compare tiers &amp; models</h2><p>One value per metric · conversations, tokens and costs are totals</p></div><label class="model-filter" for="comparison-stat-select">Metric statistic <select id="comparison-stat-select"></select></label></div>
 <section class="panel model-comparison"><h2>By tier</h2><p id="tier-caption"></p><div class="table-wrap"><table id="tier-comparison"></table></div><p>Select a tier above to explore its charts and costs. Conversations are counted once within each tier and can appear in several tiers.</p></section>
 <section class="panel model-comparison"><h2>By model</h2><p id="comparison-caption"></p><div class="table-wrap"><table id="model-comparison"></table></div><p>Select a model above to explore its charts, cost breakdown, sample counts, and all reporting windows.</p></section>
-<section class="panel model-comparison"><h2>By mode</h2><p id="mode-caption"></p><div class="table-wrap"><table id="mode-comparison"></table></div><p>Tier, model, and mode filters apply together to the charts and totals. Conversations can appear in several modes; counts are not additive.</p></section>
 <section class="panel"><div class="panel-top"><div><h2>Definitions &amp; data quality</h2><p>Understand the measurements behind the charts.</p></div><span class="unit" id="pricing-date"></span></div>
 <div class="quality-grid"><div>
 <p class="definition"><b>First-token time.</b> Explicit logged time to first token, per completed turn. Missing timings are excluded.</p>
@@ -1364,8 +1407,8 @@ HTML = r'''<!doctype html>
 <p class="definition"><b>Tool calls.</b> Model-issued function, custom-tool, web-search, and tool-search calls. Outputs and mirrored completion events are excluded; nested commands inside a call are not counted separately.</p>
 <p class="definition"><b>Distribution statistics.</b> Average is the arithmetic mean. Median is the middle sample, or the average of the two middle samples for an even count. Minimum and maximum are observed extremes. P75, P95, and P99 use nearest rank. All statistics use the same valid samples; each completed turn receives equal weight for timing and throughput.</p>
 <p class="definition"><b>Window boundaries.</b> Tokens and calls use record time; turn metrics use completion time. Today starts at midnight in the report timezone and ends at the report cutoff. Yesterday is the preceding calendar day in that timezone, excluding today's midnight. Rolling windows are exact 24-hour days. The full duration of a turn finishing in the window is assigned to that window.</p>
-<p class="definition"><b>Model attribution.</b> Tokens and calls use their recorded model, falling back to the turn model. Timing uses the model generating that turn. Conversation duration and tool counts include only that model's activity; a thread using multiple models appears in each, so conversation counts are not additive. If several models generate output within one turn, its timing is listed under “Mixed models (timing)” because per-model durations cannot be recovered.</p>
-<p class="definition"><b>Model tiers.</b> Budget: Luna, Terra, GPT-5.4-mini, Spark, codex-auto-review, and Claude Haiku. Medium: Sol, GPT-5.4, GPT-5.5, and Claude Sonnet. High: Astra, Claude Opus, Fable, and Mythos. Models outside these groups are Unclassified. Tier metrics are calculated from underlying activity, with each conversation counted once per tier. Turns using several models in the same tier retain their timing in that tier; turns spanning tiers have timing under “Mixed tiers (timing)”. Per-model pricing and the Fast premium still apply. The model selector shows models with activity in the selected tier across the available history.</p>
+<p class="definition"><b>Model attribution.</b> Fast usage has a separate model entry with a “-fast” suffix. Requests crossing a published context-pricing threshold have a “-long” suffix, including cached input when selecting the threshold; combined usage has “-fast-long”. Usage below the threshold keeps the model name unless Fast. Models without context pricing and aggregate records without per-request sizes do not receive “-long”. Tokens, calls, timing, and costs are separated by recorded mode, with the Fast premium applied to the underlying model's rates. Tokens and calls use their recorded model, falling back to the turn model. Timing uses the model generating that turn. Conversation duration and tool counts include only that model's activity; a thread using multiple models or modes appears in each, so conversation counts are not additive. If several models generate output within one turn, its timing is listed under “Mixed models (timing)”. If one model uses several modes within a turn, its timing is listed under “Mixed modes (timing)” because separate durations cannot be recovered. If one model in one mode crosses context thresholds within a turn, its timing is listed under “Mixed contexts (timing)”. Tool calls follow the context class of matching model and mode usage in their turn; ambiguous calls are listed under “Mixed contexts (tools)”. Mode and tier totals retain this activity once.</p>
+<p class="definition"><b>Model tiers.</b> Budget: Luna, Terra, GPT-5.4-mini, Spark, codex-auto-review, and Claude Haiku. Medium: Sol, GPT-5.4, GPT-5.5, and Claude Sonnet. High: Astra, Claude Opus, Fable, and Mythos. Models outside these groups are Unclassified. Tier metrics are calculated from underlying activity, with each conversation counted once per tier. Turns using several models in the same tier retain their timing in that tier; turns spanning tiers have timing under “Mixed tiers (timing)”. Per-model pricing and the Fast premium still apply. The model selector and comparison table show entries with recorded tokens in the selected window, harness, tier, and mode. Zero-token entries, including shared timing and tool-call buckets, remain included in aggregate totals and coverage.</p>
 <p class="definition"><b>Mode attribution.</b> Logged service tier “default” is Normal; “priority” or “fast” is Fast. Settings persist until changed. Per the selected assumption, unknown mode—including missing evidence, explicit null, and “auto”—is counted as Normal in all metrics and costs. Other explicit tiers have their own bucket. Tokens and calls follow their recorded tier or the latest logged settings. This combines logged mode with the Normal assumption; a backend fallback cannot be detected without a response tier. A turn with usage in several modes has its timing under “Mixed modes (timing)” because separate durations are unavailable. Conversation durations and calls include only activity attributed to the selected mode.</p>
 <p class="definition"><b>Harness coverage.</b> Claude Code reads project JSONL files, Copilot reads CLI session events, and OpenCode reads its message and tool tables. Copilot shutdown-only totals are assigned to shutdown, which does not establish when individual requests occurred. Timing samples require logged timing evidence.</p>
 <p class="definition"><b>Coverage.</b> Logs in the listed input directories include archived and active sessions. Copies sharing a conversation ID are merged; repeated usage responses, tool calls, and turn completions are counted once. Active logs are read while they may still be growing; the report cutoff limits included activity. Unfinished turns contribute recorded tokens and calls, with completion timings excluded. An older-window label does not imply a complete year of available history. Missing durations are excluded, so conversation duration can be partial.</p>
@@ -1374,7 +1417,7 @@ HTML = r'''<!doctype html>
 <details><summary>Token usage by model</summary><div class="table-wrap"><table id="models"></table></div></details>
 <details><summary>Parser diagnostics</summary><div class="table-wrap"><table id="diagnostics"></table></div><ul class="warnings" id="warnings"></ul></details>
 <details><summary>Exact metrics for every window</summary><div class="table-wrap"><table id="all-metrics"></table></div></details>
-<h3 style="margin-top:18px">Recorded costs &amp; billing units</h3><p>Harness totals for the selected window; tier, model, and mode filters do not apply. Recorded USD, credits, and request counters are separate from the API estimate above.</p><div class="table-wrap"><table id="recorded-billing"></table></div><h3 style="margin-top:18px">Matched OpenRouter prices</h3><p>Current catalog rates in USD per million tokens.</p><div class="table-wrap"><table id="router-prices"></table></div><p class="sources" id="sources"></p>
+<h3 style="margin-top:18px">Recorded costs &amp; billing units</h3><p>Harness totals for the selected window; tier, model, and mode filters do not apply. Recorded USD, credits, and request counters are separate from the API estimate above.</p><div class="table-wrap"><table id="recorded-billing"></table></div><h3 style="margin-top:18px">Matched OpenRouter prices</h3><p>Base catalog rates in USD per million tokens; context overrides are applied per request in estimated costs.</p><div class="table-wrap"><table id="router-prices"></table></div><p class="sources" id="sources"></p>
 </section>
 <footer class="footer"><span id="footer"></span><span>Generated locally · No conversation content embedded</span></footer>
 </main><div class="tooltip" id="tooltip" role="tooltip" hidden></div>
@@ -1390,6 +1433,7 @@ let selected=0,selectedModel='',selectedMode='',selectedTier='',selectedHarness=
 const harnessGroup=()=>selectedHarness?data.by_harness[selectedHarness]:data;
 const activeGroup=()=>selectedTier?harnessGroup().by_tier[selectedTier]:harnessGroup();
 const activeModels=()=>selectedMode?activeGroup().by_mode[selectedMode].by_model:activeGroup().by_model;
+const visibleModels=()=>Object.entries(activeModels()).filter(([,windows])=>windows[selected].total_tokens>0);
 const activeWindows=()=>selectedModel?activeModels()[selectedModel]:selectedMode?activeGroup().by_mode[selectedMode].windows:activeGroup().windows;
 const $=id=>document.getElementById(id), number=n=>Number(n).toLocaleString('en-US',{maximumFractionDigits:2}), money=n=>Number(n).toLocaleString('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2});
 const compact=n=>Number(n).toLocaleString('en-US',{notation:'compact',maximumFractionDigits:1});
@@ -1408,34 +1452,32 @@ function legend(){const el=text('div','','legend');chartStats.forEach(([,name,co
 function performance(window){$('performance').replaceChildren();for(const [key,title,unit,desc] of metricDefs){const panel=text('article','','panel'),top=text('div','','panel-top'),heading=text('div','');heading.append(text('h3',title),text('p',desc));top.append(heading,text('span',unit,'unit'));panel.append(top,legend());const chart=text('div','','chart');chart.append(metricChart(key,title,unit));panel.append(chart);const stats=text('div','','stats');for(const [stat,label] of statDefs){const e=text('div','','stat');e.append(text('span',label.toUpperCase()),text('strong',displayMetric(key,window.metrics[key][stat])));stats.append(e)}panel.append(stats,text('div',`${number(window.metrics[key].count)} valid ${key==='length'||key==='tools'?'conversation':'turn'} samples · ${window.label}`,'samples'));$('performance').append(panel)}}
 function donut(categories,field,total,title){const svg=svgBase(title,190,190),cx=95,cy=95,r=68,length=2*Math.PI*r;svg.append(svgNode('circle',{cx,cy,r,fill:'none',stroke:'#edf1f6','stroke-width':20}));let offset=0;categories.forEach((cat,i)=>{const value=Number(cat[field]);if(value<=0||total<=0)return;const segment=value/total*length,circle=svgNode('circle',{cx,cy,r,fill:'none',stroke:colors[i],'stroke-width':20,'stroke-dasharray':`${segment} ${length-segment}`,'stroke-dashoffset':-offset,transform:'rotate(-90 95 95)'});tip(circle,`${cat.name}: ${field==='cost'?money(value):number(value)} (${number(value/total*100)}%)`);svg.append(circle);offset+=segment});svg.append(svgNode('text',{x:95,y:94,'text-anchor':'middle',fill:'#172a3c','font-size':22,'font-weight':650},field==='cost'?money(total):compact(total)),svgNode('text',{x:95,y:116,'text-anchor':'middle',fill:'#8290a1','font-size':10},field==='cost'?'ESTIMATED USD':'TOTAL TOKENS'));return svg}
 function breakdowns(window){$('breakdowns').replaceChildren();for(const field of ['tokens','cost']){const panel=text('article','','panel'),title=field==='tokens'?'Token composition':'Cost composition';panel.append(text('h3',title),text('p',field==='tokens'?'Separate categories · each token counted once':`Estimated API-equivalent token cost${window.partial_cost?' · partial':''}`));const body=text('div','','breakdown-body');body.append(donut(window.categories,field,field==='tokens'?window.total_tokens:Number(window.cost),title));const wrap=text('div','','table-wrap'),t=document.createElement('table');table(t,['Category',field==='tokens'?'Tokens':'USD'],[]);const tbody=t.querySelector('tbody');window.categories.forEach((cat,i)=>{const tr=document.createElement('tr'),label=text('td',cat.name,'label'),dot=text('i','','swatch');dot.style.background=colors[i];dot.style.marginRight='7px';label.prepend(dot);const value=field==='tokens'?number(cat.tokens):money(cat.cost);tr.append(label,text('td',value+(field==='cost'&&cat.unpriced_tokens?' *':''),'num'));tbody.append(tr)});const foot=document.createElement('tfoot'),row=document.createElement('tr');row.append(text('td','Total'),text('td',field==='tokens'?number(window.total_tokens):money(window.cost),'num'));foot.append(row);t.append(foot);wrap.append(t);body.append(wrap);panel.append(body);if(field==='cost'&&window.partial_cost)panel.append(text('p',`* ${number(window.unpriced_tokens)} tokens excluded from the API estimate; see unpriced usage and recorded billing below.`));$('breakdowns').append(panel)}}
-function selectWindow(index){selected=index;recordedBilling();$('tooltip').hidden=true;const w=activeWindows()[index];$('model-scope').textContent=`${selectedHarness||'All harnesses'} · ${selectedTier||'All tiers'} · ${selectedModel||'All models'} · ${selectedMode||'All modes'}`;[...$('tabs').children].forEach((b,i)=>b.setAttribute('aria-pressed',i===index));$('range').textContent=w.end_exclusive?`${fmtDate(w.start)} · full calendar day`:`${fmtDate(w.start)} – ${fmtTime(w.end)}`;$('notice').hidden=!w.partial_cost&&!Object.keys(data.quality).some(k=>k.startsWith('Malformed')||k==='Unreadable files'||k==='Invalid usage records');$('notice').textContent=w.partial_cost?`Partial cost estimate: ${number(w.unpriced_tokens)} tokens lack a verified rate or the category detail needed to calculate cost. Their usage is included in token totals.`:'Some records could not be read. Review parser diagnostics below.';$('cards').replaceChildren();const cards=[['Conversations',number(w.conversations),'Active threads, including subagents',colors[0]],['Total tokens',compact(w.total_tokens),`${number(w.total_tokens)} recorded tokens`,colors[1]],['Active duration',number(w.active_seconds/3600)+' h','Completed turn durations, summed',colors[2]],['Estimated cost',money(w.cost),w.partial_cost?'Partial estimate · USD':'USD · API-equivalent estimate',colors[3]]];for(const [label,value,note,color] of cards){const c=text('article','','card');c.style.setProperty('--accent',color);c.append(text('div',label,'card-label'),text('div',value,'card-value'),text('div',note,'card-note'));$('cards').append(c)}performance(w);breakdowns(w);tierComparison();modelComparison();modeComparison();exactMetrics();const coverage=[['Completed turns',w.coverage['Completed turns']||0],['First-token timing samples',w.metrics.ttft.count],['Missing first-token timing',w.coverage['Missing first-token timing']||0],['Missing turn duration',w.coverage['Missing turn duration']||0],['Throughput samples',w.metrics.throughput.count],['Missing throughput samples',w.coverage['Missing throughput samples']||0],['Conversation duration samples',w.metrics.length.count],['Aborted turns',w.coverage['Aborted turns']||0],['Unfinished turns started in window',w.coverage['Unfinished turns']||0],['Usage responses',w.coverage['Usage responses']||0],['Tool calls',w.tool_calls]];table($('coverage'),['Measurement','Count'],coverage.map(([k,v])=>[k,number(v)]));$('unpriced').replaceChildren();if(w.partial_cost){const t=document.createElement('table');table(t,['Model','Unpriced tokens'],Object.entries(w.unpriced).map(([k,v])=>[k,number(v)]));$('unpriced').append(t)}else $('unpriced').append(text('p','All recorded usage in this window has a published or assumed rate.'));table($('models'),['Model','Total tokens'],Object.entries(w.models).map(([k,v])=>[k,number(v)]))}
+function selectWindow(index){selected=index;modelOptions();recordedBilling();$('tooltip').hidden=true;const w=activeWindows()[index];$('model-scope').textContent=`${selectedHarness||'All harnesses'} · ${selectedTier||'All tiers'} · ${selectedModel||'All models'} · ${selectedMode||'All modes'}`;[...$('tabs').children].forEach((b,i)=>b.setAttribute('aria-pressed',i===index));$('range').textContent=w.end_exclusive?`${fmtDate(w.start)} · full calendar day`:`${fmtDate(w.start)} – ${fmtTime(w.end)}`;$('notice').hidden=!w.partial_cost&&!Object.keys(data.quality).some(k=>k.startsWith('Malformed')||k==='Unreadable files'||k==='Invalid usage records');$('notice').textContent=w.partial_cost?`Partial cost estimate: ${number(w.unpriced_tokens)} tokens lack a verified rate or the category detail needed to calculate cost. Their usage is included in token totals.`:'Some records could not be read. Review parser diagnostics below.';$('cards').replaceChildren();const cards=[['Conversations',number(w.conversations),'Active threads, including subagents',colors[0]],['Total tokens',compact(w.total_tokens),`${number(w.total_tokens)} recorded tokens`,colors[1]],['Active duration',number(w.active_seconds/3600)+' h','Completed turn durations, summed',colors[2]],['Estimated cost',money(w.cost),w.partial_cost?'Partial estimate · USD':'USD · API-equivalent estimate',colors[3]]];for(const [label,value,note,color] of cards){const c=text('article','','card');c.style.setProperty('--accent',color);c.append(text('div',label,'card-label'),text('div',value,'card-value'),text('div',note,'card-note'));$('cards').append(c)}performance(w);breakdowns(w);tierComparison();modelComparison();exactMetrics();const coverage=[['Completed turns',w.coverage['Completed turns']||0],['First-token timing samples',w.metrics.ttft.count],['Missing first-token timing',w.coverage['Missing first-token timing']||0],['Missing turn duration',w.coverage['Missing turn duration']||0],['Throughput samples',w.metrics.throughput.count],['Missing throughput samples',w.coverage['Missing throughput samples']||0],['Conversation duration samples',w.metrics.length.count],['Aborted turns',w.coverage['Aborted turns']||0],['Unfinished turns started in window',w.coverage['Unfinished turns']||0],['Usage responses',w.coverage['Usage responses']||0],['Tool calls',w.tool_calls]];table($('coverage'),['Measurement','Count'],coverage.map(([k,v])=>[k,number(v)]));$('unpriced').replaceChildren();if(w.partial_cost){const t=document.createElement('table');table(t,['Model','Unpriced tokens'],Object.entries(w.unpriced).map(([k,v])=>[k,number(v)]));$('unpriced').append(t)}else $('unpriced').append(text('p','All recorded usage in this window has a published or assumed rate.'));table($('models'),['Model','Total tokens'],Object.entries(w.models).filter(([,tokens])=>tokens>0).map(([k,v])=>[k,number(v)]))}
 for(const [stat,label] of statDefs){const option=text('option',label);option.value=stat;$('comparison-stat-select').append(option);}
 $('comparison-stat-select').value=selectedStatistic;
-$('comparison-stat-select').addEventListener('change',()=>{selectedStatistic=$('comparison-stat-select').value;tierComparison();modelComparison();modeComparison();});
+$('comparison-stat-select').addEventListener('change',()=>{selectedStatistic=$('comparison-stat-select').value;tierComparison();modelComparison();});
 $('subtitle').textContent=`${number(data.files)} log files · ${number(data.threads)} threads · ${data.timezone}`;
 data.windows.forEach((w,i)=>{const b=text('button',w.label);b.type='button';b.setAttribute('aria-pressed',i===0);b.addEventListener('click',()=>selectWindow(i));$('tabs').append(b)});
 $('pricing-date').textContent=`Pricing: ${data.pricing_date}`;
 table($('diagnostics'),['Diagnostic','Count'],Object.entries(data.quality).map(([k,v])=>[k,number(v)]));data.warnings.forEach(w=>$('warnings').append(text('li',w)));
 function exactMetrics(){const rows=[];for(const w of activeWindows())for(const [key,title,unit] of metricDefs){const m=w.metrics[key];rows.push([`${w.label} · ${title} (${unit})`,displayMetric(key,m.avg),displayMetric(key,m.min),displayMetric(key,m.median),displayMetric(key,m.max),displayMetric(key,m.p75),displayMetric(key,m.p95),displayMetric(key,m.p99),number(m.count)])}table($('all-metrics'),['Window / metric','Average','Minimum','Median','Maximum','P75','P95','P99','Samples'],rows);}
-function modelComparison(){const entries=Object.entries(activeModels()).filter(([model,windows])=>windows[selected].conversations>0);const rows=entries.map(([model,windows])=>{const w=windows[selected];return [model,number(w.conversations),comparisonMetric('ttft',w.metrics.ttft),comparisonMetric('throughput',w.metrics.throughput),comparisonMetric('length',w.metrics.length),comparisonMetric('tools',w.metrics.tools),number(w.total_tokens),money(w.cost)+(w.partial_cost?' (partial)':'')]});table($('model-comparison'),['Model','Conversations','First token (s)','Throughput (tokens/s)','Length (min)','Calls / conversation','Total tokens','Cost (USD)'],rows);[...$('model-comparison').querySelectorAll('tbody tr')].forEach((row,i)=>row.dataset.selected=entries[i][0]===selectedModel);$('comparison-caption').textContent=`${data.windows[selected].label} · ${comparisonLabel()} per metric · ${selectedTier||'All tiers'} · ${selectedMode||'All modes'} · all models with activity in this window`;}
-function modelOptions(){const select=$('model-select');select.replaceChildren(text('option','All models'));select.firstChild.value='';for(const model of Object.keys(activeGroup().by_model)){const option=text('option',model);option.value=model;select.append(option);}if(!(selectedModel in activeGroup().by_model))selectedModel='';select.value=selectedModel;}
-modelOptions();
+function modelComparison(){const entries=visibleModels();const rows=entries.map(([model,windows])=>{const w=windows[selected];return [model,number(w.conversations),comparisonMetric('ttft',w.metrics.ttft),comparisonMetric('throughput',w.metrics.throughput),comparisonMetric('length',w.metrics.length),comparisonMetric('tools',w.metrics.tools),number(w.total_tokens),money(w.cost)+(w.partial_cost?' (partial)':'')]});table($('model-comparison'),['Model','Conversations','First token (s)','Throughput (tokens/s)','Length (min)','Calls / conversation','Total tokens','Cost (USD)'],rows);[...$('model-comparison').querySelectorAll('tbody tr')].forEach((row,i)=>row.dataset.selected=entries[i][0]===selectedModel);$('comparison-caption').textContent=`${data.windows[selected].label} · ${comparisonLabel()} per metric · ${selectedTier||'All tiers'} · ${selectedMode||'All modes'} · models with recorded tokens in this window`;}
+function modelOptions(){const select=$('model-select');select.replaceChildren(text('option','All models'));select.firstChild.value='';const models=visibleModels().map(([model])=>model);for(const model of models){const option=text('option',model);option.value=model;select.append(option);}if(!models.includes(selectedModel))selectedModel='';select.value=selectedModel;}
 $('model-select').addEventListener('change',()=>{selectedModel=$('model-select').value;selectWindow(selected);});
-function modeComparison(){const entries=Object.entries(activeGroup().by_mode).map(([mode,group])=>[mode,(selectedModel?group.by_model[selectedModel]:group.windows)[selected]]);const rows=entries.map(([mode,w])=>[mode,number(w.conversations),comparisonMetric('ttft',w.metrics.ttft),comparisonMetric('throughput',w.metrics.throughput),comparisonMetric('length',w.metrics.length),comparisonMetric('tools',w.metrics.tools),number(w.total_tokens),money(w.cost)+(w.partial_cost?' (partial)':'')]);table($('mode-comparison'),['Mode','Conversations','First token (s)','Throughput (tokens/s)','Length (min)','Calls / conversation','Total tokens','Cost (USD)'],rows);[...$('mode-comparison').querySelectorAll('tbody tr')].forEach((row,i)=>row.dataset.selected=entries[i][0]===selectedMode);$('mode-caption').textContent=`${data.windows[selected].label} · ${comparisonLabel()} per metric · ${selectedTier||'All tiers'} · ${selectedModel||'All models'} · all modes`;}
 function modeOptions(){const select=$('mode-select');select.replaceChildren(text('option','All modes'));select.firstChild.value='';for(const mode of Object.keys(harnessGroup().by_mode)){const option=text('option',mode);option.value=mode;select.append(option);}if(!(selectedMode in harnessGroup().by_mode))selectedMode='';select.value=selectedMode;}
 modeOptions();
 $('mode-select').addEventListener('change',()=>{selectedMode=$('mode-select').value;selectWindow(selected);});
 function tierComparison(){const entries=Object.entries(harnessGroup().by_tier).map(([tier,group])=>{const scope=selectedMode?group.by_mode[selectedMode]:group;return [tier,(selectedModel?scope.by_model[selectedModel]:scope.windows)?.[selected]];}).filter(([,w])=>w);const rows=entries.map(([tier,w])=>[tier,number(w.conversations),comparisonMetric('ttft',w.metrics.ttft),comparisonMetric('throughput',w.metrics.throughput),comparisonMetric('length',w.metrics.length),comparisonMetric('tools',w.metrics.tools),number(w.total_tokens),money(w.cost)+(w.partial_cost?' (partial)':'')]);table($('tier-comparison'),['Tier','Conversations','First token (s)','Throughput (tokens/s)','Length (min)','Calls / conversation','Total tokens','Cost (USD)'],rows);[...$('tier-comparison').querySelectorAll('tbody tr')].forEach((row,i)=>row.dataset.selected=entries[i][0]===selectedTier);$('tier-caption').textContent=`${data.windows[selected].label} · ${comparisonLabel()} per metric · ${selectedMode||'All modes'} · ${selectedModel||'All models'} · all tiers`;}
 function tierOptions(){const select=$('tier-select');select.replaceChildren(text('option','All tiers'));select.firstChild.value='';for(const tier of Object.keys(harnessGroup().by_tier)){const option=text('option',tier);option.value=tier;select.append(option);}if(!(selectedTier in harnessGroup().by_tier))selectedTier='';select.value=selectedTier;}
 tierOptions();
-$('tier-select').addEventListener('change',()=>{selectedTier=$('tier-select').value;modelOptions();selectWindow(selected);});
+$('tier-select').addEventListener('change',()=>{selectedTier=$('tier-select').value;selectWindow(selected);});
 $('sources').append(document.createTextNode(`Rates verified ${data.pricing_date}: `));const link=text('a','OpenAI API pricing');link.href=data.pricing_source;link.rel='noreferrer';$('sources').append(link,document.createTextNode('. Rates are embedded in the script and are not updated automatically. Input directories: '+data.sources.join(', ')));
 const anthropicLink=text('a','Anthropic API pricing');anthropicLink.href=data.anthropic_pricing_source;anthropicLink.rel='noreferrer';$('sources').append(document.createTextNode(` · Anthropic verified ${data.anthropic_pricing_date}: `),anthropicLink);if(data.openrouter){const routerLink=text('a','OpenRouter model catalog');routerLink.href=data.openrouter.source;routerLink.rel='noreferrer';$('sources').append(document.createTextNode(' · '),routerLink,document.createTextNode(data.openrouter.error?` unavailable: ${data.openrouter.error}`:data.openrouter.retrieved?` retrieved ${fmtTime(data.openrouter.retrieved)}`:' · supplied snapshot (retrieval date unknown)'));}
 $('sources').append(document.createTextNode(' · '));const modeLink=text('a','Fast mode documentation');modeLink.href='https://developers.openai.com/api/docs/guides/fast-mode';modeLink.rel='noreferrer';$('sources').append(modeLink);
 $('footer').textContent=`Report cutoff: ${fmtTime(data.generated)} (${data.timezone})`;
 for(const harness of Object.keys(data.by_harness)){const option=text('option',harness);option.value=harness;$('harness-select').append(option);}
-$('harness-select').addEventListener('change',()=>{selectedHarness=$('harness-select').value;modeOptions();tierOptions();modelOptions();selectWindow(selected);});
-function recordedBilling(){const units=harnessGroup().windows[selected].recorded_billing;table($('recorded-billing'),['Recorded measurement','Amount'],Object.entries(units).map(([unit,amount])=>[unit,unit.endsWith('USD')?money(amount):number(amount)]));table($('router-prices'),['Model','OpenRouter ID','Input / MTok','Cache read / MTok','Output / MTok'],Object.entries(data.openrouter_rates).filter(([model])=>model in harnessGroup().by_model).map(([model,r])=>[model,r.id,money(r.input),r.cached===null?'N/A':money(r.cached),money(r.output)]));}
+$('harness-select').addEventListener('change',()=>{selectedHarness=$('harness-select').value;modeOptions();tierOptions();selectWindow(selected);});
+function recordedBilling(){const units=harnessGroup().windows[selected].recorded_billing;table($('recorded-billing'),['Recorded measurement','Amount'],Object.entries(units).map(([unit,amount])=>[unit,unit.endsWith('USD')?money(amount):number(amount)]));table($('router-prices'),['Model','OpenRouter ID','Input / MTok','Cache read / MTok','Output / MTok'],Object.entries(data.openrouter_rates).filter(([model])=>visibleModels().some(([name])=>name===model)).map(([model,r])=>[model,r.id,money(r.input),r.cached===null?'N/A':money(r.cached),money(r.output)]));}
 selectWindow(0);
 </script></body></html>'''
 

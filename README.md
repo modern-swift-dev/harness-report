@@ -102,6 +102,12 @@ Costs are **API-equivalent estimates, not subscription bills**. Embedded rates a
 
 Choose a reporting window and filter by harness, tier, model, or mode. Comparison tables offer average, median, minimum, maximum, P75, P95, and P99 statistics.
 
+The model selector and comparison table show only entries with recorded tokens in the selected window, harness, tier, and mode. Zero-token entries, including shared timing and tool-call buckets, still contribute to aggregate totals and coverage. Changing filters resets the model selection to All models if that model has no tokens in the new scope.
+
+Fast usage has its own model entry with a `-fast` suffix, such as `gpt-6.1-sol-fast`; Normal usage keeps the original name. Each entry has separate tokens, costs, tool calls, and timing. OpenAI Fast costs include the 50% premium. A turn that uses both modes keeps its timing under **Mixed modes (timing)** because separate durations are unavailable.
+
+Requests crossing a model's context-pricing threshold have a `-long` suffix, such as `gpt-6.1-sol-long`; Fast requests above the threshold use `gpt-6.1-sol-fast-long`. Thresholds use total input, including cached input, and follow embedded model prices or matched OpenRouter context overrides. Models without context pricing and aggregate records lacking per-request sizes keep their original names. Tokens and costs follow each request. A turn mixing context classes for one model and mode keeps shared timing under **Mixed contexts (timing)**. Tool calls follow matching turn usage when it has one context class; ambiguous calls appear under **Mixed contexts (tools)**. Mode and tier totals retain this activity once.
+
 - **Today and Yesterday** follow the report timezone. Rolling windows cover exact 24-hour days.
 - **First-token time** requires explicit logged timing; missing samples are excluded.
 - **Effective throughput** divides output tokens, including reasoning, by full turn duration, including tool execution and waiting.

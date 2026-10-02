@@ -476,6 +476,109 @@ class ReportTests(unittest.TestCase):
         costs, missing = metrics.price_usage("gpt-5.5", u)
         self.assertEqual(missing, {metrics.Category.CACHE_WRITE: 100})
 
+    def test_long_model_entries_separate_context_and_fast_activity(self):
+        for legacy_usage in (False, True):
+            with self.subTest(legacy_usage=legacy_usage):
+                rows = prefix()
+                expected = {}
+                cumulative = usage(input=0, output=0, cached=0, reasoning=0)
+                for index, (mode, input_tokens) in enumerate([
+                    ("default", 272000), ("default", 272001),
+                    ("priority", 272000), ("priority", 272001),
+                ]):
+                    turn = f"t{index + 1}"
+                    at = START + timedelta(seconds=index * 20)
+                    counts = usage(input=input_tokens, cached=272000)
+                    cumulative = {key: cumulative[key] + count for key, count in counts.items()}
+                    rows += [event("thread_settings_applied", at,
+                                   thread_settings={"service_tier": mode}),
+                             event("task_started", at, turn_id=turn)]
+                    rows.append(legacy(cumulative, at + timedelta(seconds=1), last=counts) if legacy_usage else
+                                modern(turn, f"r{index}", counts, at + timedelta(seconds=1)))
+                    rows += [record("response_item", {"type": "function_call", "call_id": f"c{index}"},
+                                    at + timedelta(seconds=2)), complete(turn, at + timedelta(seconds=10))]
+                    speed = metrics.SpeedMode.FAST if mode == "priority" else metrics.SpeedMode.NORMAL
+                    name = "gpt-6.1-sol" + ("-fast" if mode == "priority" else "")
+                    name += "-long" if input_tokens > 272000 else ""
+                    expected[name] = (input_tokens + 100, speed, metrics.Usage(input_tokens, 100, 272000, 20))
+                self.write(rows)
+                report = self.report()
+                for group in [report, report["by_harness"]["codex"], report["by_tier"]["Medium"]]:
+                    self.assertEqual(set(group["by_model"]), set(expected))
+                    for name, (tokens, speed, counts) in expected.items():
+                        window = group["by_model"][name][0]
+                        costs, missing = metrics.price_usage("gpt-6.1-sol", counts, speed)
+                        self.assertFalse(missing)
+                        self.assertEqual(window["total_tokens"], tokens)
+                        self.assertEqual(Decimal(window["cost"]), sum(costs.values()))
+                        self.assertEqual(window["tool_calls"], 1)
+                        self.assertEqual(window["active_seconds"], 10)
+                        self.assertEqual(window["metrics"]["ttft"]["count"], 1)
+                        self.assertEqual(window["models"], {name: tokens})
+                        self.assertEqual(group["by_mode"][speed.value]["by_model"][name][0], window)
+                    for i, total in enumerate(group["windows"]):
+                        members = [windows[i] for windows in group["by_model"].values()]
+                        for key in ["total_tokens", "tool_calls", "active_seconds", "unpriced_tokens"]:
+                            self.assertEqual(sum(w[key] for w in members), total[key])
+                        self.assertEqual(sum(Decimal(w["cost"]) for w in members), Decimal(total["cost"]))
+                self.assertEqual(report["windows"][0]["conversations"], 1)
+                self.assertEqual(report["by_tier"]["Medium"]["windows"][0]["conversations"], 1)
+                self.assertIn("gpt-6.1-sol-fast-long", metrics.render_report(report))
+
+    def test_mixed_context_turn_keeps_timing_and_ambiguous_tools_separate(self):
+        for speed in [metrics.SpeedMode.NORMAL, metrics.SpeedMode.FAST]:
+            with self.subTest(speed=speed):
+                rows = prefix()
+                rows[0]["payload"]["service_tier"] = "priority" if speed == metrics.SpeedMode.FAST else "default"
+                self.write(rows + [modern(counts=usage(input=272000)),
+                    modern(response="r2", counts=usage(input=272001), at=START + timedelta(seconds=3)),
+                    record("response_item", {"type": "function_call", "call_id": "mixed"}), complete()])
+                report = self.report()
+                name = "gpt-6.1-sol-fast" if speed == metrics.SpeedMode.FAST else "gpt-6.1-sol"
+                group = report["by_mode"][speed.value]
+                for model in [name, name + "-long"]:
+                    window = group["by_model"][model][0]
+                    self.assertEqual(window["active_seconds"], 0)
+                    self.assertEqual(window["tool_calls"], 0)
+                    self.assertEqual(window["metrics"]["ttft"]["count"], 0)
+                timing = group["by_model"]["Mixed contexts (timing)"][0]
+                self.assertEqual(timing["active_seconds"], 10)
+                self.assertEqual(timing["metrics"]["ttft"]["count"], 1)
+                self.assertEqual(timing["metrics"]["throughput"]["avg"], 20)
+                self.assertEqual(timing["total_tokens"], 0)
+                self.assertEqual(group["by_model"]["Mixed contexts (tools)"][0]["tool_calls"], 1)
+                self.assertEqual(report["by_tier"]["Medium"]["windows"][0]["active_seconds"], 10)
+                members = [windows[0] for windows in report["by_model"].values()]
+                total = report["windows"][0]
+                for key in ["total_tokens", "tool_calls", "active_seconds"]:
+                    self.assertEqual(sum(w[key] for w in members), total[key])
+                self.assertEqual(sum(Decimal(w["cost"]) for w in members), Decimal(total["cost"]))
+
+    def test_long_context_labels_follow_model_specific_prices_and_proxies(self):
+        for model, input_tokens, long_context in [
+            ("claude-sonnet-4-5", 200000, False), ("claude-sonnet-4-5", 200001, True),
+            ("claude-sonnet-4-6", 300000, False), ("gpt-5.4-mini", 300000, False),
+            ("unpublished-model", 300000, False), ("codex-auto-review", 272001, True),
+        ]:
+            with self.subTest(model=model, input_tokens=input_tokens):
+                self.write(prefix(model=model) + [modern(counts=usage(input=input_tokens)), complete()])
+                report = self.report()
+                name = model + ("-long" if long_context else "")
+                self.assertEqual(set(report["by_model"]), {name})
+                self.assertEqual(report["windows"][0]["models"], {name: input_tokens + 100})
+
+    def test_aggregate_usage_does_not_get_long_suffix(self):
+        turn = metrics.Turn("t1", start=START, end=START + timedelta(seconds=10), duration=10,
+                            model="gpt-6.1-sol", completed=True,
+                            modern=[metrics.UsageEvent(START, metrics.Usage(300000, 100),
+                                                       "gpt-6.1-sol", "aggregate", aggregate=True)])
+        report = metrics.build_breakdown([metrics.Thread("aggregate", turns={turn.id: turn})], NOW)
+        self.assertEqual(set(report["by_model"]), {"gpt-6.1-sol"})
+        window = report["by_model"]["gpt-6.1-sol"][0]
+        self.assertTrue(window["partial_cost"])
+        self.assertEqual(window["unpriced"], {"gpt-6.1-sol": 300100})
+        self.assertEqual(window["coverage"]["Aggregate snapshots"], 1)
+
     def test_malformed_and_invalid_usage(self):
         self.write(prefix() + ['{bad-json', '[]', modern(counts=usage(cached=2000)),
                               modern(response="valid"), complete()])
@@ -562,6 +665,57 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(no_usage["total_tokens"], 0)
         self.assertEqual(no_usage["metrics"]["ttft"]["avg"], .5)
         self.assertIsNone(no_usage["metrics"]["throughput"]["avg"])
+
+    def test_by_model_separates_normal_and_fast_usage_with_original_rates(self):
+        second_start = START + timedelta(seconds=20)
+        for legacy_usage in (False, True):
+            with self.subTest(legacy_usage=legacy_usage):
+                first = legacy(usage()) if legacy_usage else modern()
+                second = (legacy(usage(2000, 200, 800, 40), second_start + timedelta(seconds=1), last=usage())
+                          if legacy_usage else modern("t2", "r2", at=second_start + timedelta(seconds=1)))
+                self.write(prefix() + [first,
+                    record("response_item", {"type": "function_call", "call_id": "normal"}), complete(),
+                    event("thread_settings_applied", second_start,
+                          thread_settings={"service_tier": "priority"}),
+                    event("task_started", second_start, turn_id="t2"), second,
+                    record("response_item", {"type": "function_call", "call_id": "fast"}, second_start),
+                    complete("t2", second_start + timedelta(seconds=10))])
+                r = self.report()
+                self.assertEqual(set(r["by_model"]), {"gpt-6.1-sol", "gpt-6.1-sol-fast"})
+                for group in (r, r["by_harness"]["codex"], r["by_tier"]["Medium"]):
+                    normal = group["by_model"]["gpt-6.1-sol"][0]
+                    fast = group["by_model"]["gpt-6.1-sol-fast"][0]
+                    for window in (normal, fast):
+                        self.assertEqual(window["conversations"], 1)
+                        self.assertEqual(window["total_tokens"], 1100)
+                        self.assertEqual(window["tool_calls"], 1)
+                        self.assertEqual(window["active_seconds"], 10)
+                        self.assertEqual(window["metrics"]["ttft"]["count"], 1)
+                        self.assertEqual(window["metrics"]["throughput"]["avg"], 10)
+                        self.assertFalse(window["partial_cost"])
+                    self.assertEqual(Decimal(fast["cost"]), Decimal(normal["cost"]) * Decimal("1.5"))
+                    self.assertEqual(group["by_mode"]["Normal"]["by_model"]["gpt-6.1-sol-fast"][0]["total_tokens"], 0)
+                    self.assertEqual(group["by_mode"]["Fast"]["by_model"]["gpt-6.1-sol"][0]["total_tokens"], 0)
+                    for i, total in enumerate(group["windows"]):
+                        members = [ws[i] for ws in group["by_model"].values()]
+                        for key in ("total_tokens", "tool_calls", "active_seconds"):
+                            self.assertEqual(sum(w[key] for w in members), total[key])
+                        self.assertEqual(sum(Decimal(w["cost"]) for w in members), Decimal(total["cost"]))
+                self.assertEqual(r["windows"][0]["models"], {"gpt-6.1-sol": 1100, "gpt-6.1-sol-fast": 1100})
+
+    def test_fast_model_entry_preserves_catalog_identity_and_unpriced_usage(self):
+        rows = prefix(model="vendor/new-model")
+        rows[0]["payload"]["service_tier"] = "priority"
+        self.write(rows + [modern(), complete()])
+        catalog = metrics.openrouter_prices({"data": [{"id": "vendor/new-model",
+            "pricing": {"prompt": ".000002", "completion": ".00001"}}]})
+        report = metrics.collect_report(self.root, NOW, catalog=catalog)
+        self.assertEqual(set(report["by_model"]), {"vendor/new-model-fast"})
+        self.assertEqual(report["openrouter_rates"]["vendor/new-model-fast"]["id"], "vendor/new-model")
+        window = report["by_model"]["vendor/new-model-fast"][0]
+        self.assertEqual(window["total_tokens"], 1100)
+        self.assertEqual(window["unpriced"], {"vendor/new-model-fast": 1100})
+        self.assertTrue(window["partial_cost"])
 
     def test_multiple_models_inside_one_turn_do_not_duplicate_timing(self):
         self.write(prefix() + [modern(),
@@ -656,7 +810,7 @@ class ReportTests(unittest.TestCase):
                           modern(), complete()])
         r = self.report()
         self.assertEqual(r["by_mode"]["Fast"]["windows"][0]["total_tokens"], 1100)
-        self.assertEqual(r["by_mode"]["Fast"]["by_model"]["gpt-5.5"][0]["total_tokens"], 1100)
+        self.assertEqual(r["by_mode"]["Fast"]["by_model"]["gpt-5.5-fast"][0]["total_tokens"], 1100)
 
     def test_mode_switch_between_turns_and_model_intersection(self):
         rows = prefix()
@@ -678,7 +832,7 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(w["metrics"]["throughput"]["avg"], 10)
         self.assertEqual(Decimal(normal["cost"]), Decimal(".00224"))
         self.assertEqual(Decimal(fast["cost"]), Decimal(".0093"))
-        self.assertEqual(r["by_mode"]["Normal"]["by_model"]["gpt-5.5"][0]["total_tokens"], 0)
+        self.assertEqual(r["by_mode"]["Normal"]["by_model"]["gpt-5.5-fast"][0]["total_tokens"], 0)
         self.assertEqual(r["windows"][0]["conversations"], 1)
         for i, total in enumerate(r["windows"]):
             modes = [g["windows"][i] for g in r["by_mode"].values()]
@@ -701,6 +855,11 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(w["total_tokens"], 1100)
             self.assertEqual(w["active_seconds"], 0)
             self.assertIsNone(w["metrics"]["ttft"]["avg"])
+        for model in ("gpt-6.1-sol", "gpt-6.1-sol-fast"):
+            self.assertEqual(r["by_model"][model][0]["total_tokens"], 1100)
+            self.assertEqual(r["by_model"][model][0]["active_seconds"], 0)
+            self.assertIsNone(r["by_model"][model][0]["metrics"]["ttft"]["avg"])
+        self.assertEqual(r["by_model"]["Mixed modes (timing)"][0]["active_seconds"], 10)
         mixed = r["by_mode"]["Mixed modes (timing)"]["windows"][0]
         self.assertEqual(mixed["total_tokens"], 0)
         self.assertEqual(mixed["active_seconds"], 10)
@@ -771,7 +930,7 @@ class ReportTests(unittest.TestCase):
         self.write(rows + [modern(), complete()])
         report = self.report()
         self.assertEqual(report["price_proxies"]["codex-auto-review"], "gpt-5.6-luna")
-        w = report["by_mode"]["Fast"]["by_model"]["codex-auto-review"][0]
+        w = report["by_mode"]["Fast"]["by_model"]["codex-auto-review-fast"][0]
         self.assertFalse(w["partial_cost"])
         self.assertEqual(Decimal(w["cost"]), Decimal(".000372"))
         self.assertIn('codex-auto-review uses GPT-5.6-luna rates', metrics.render_report(report))
@@ -851,8 +1010,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(w["metrics"]["ttft"]["p95"], 2)
         self.assertEqual(w["metrics"]["throughput"]["p99"], 15)
         self.assertEqual(tier["by_mode"]["Fast"]["windows"][0]["active_seconds"], 30)
-        self.assertEqual(tier["by_mode"]["Fast"]["by_model"]["gpt-5.6-terra"][0]["total_tokens"], 2200)
-        self.assertEqual(tier["by_mode"]["Normal"]["by_model"]["gpt-5.6-terra"][0]["total_tokens"], 0)
+        self.assertEqual(tier["by_mode"]["Fast"]["by_model"]["gpt-5.6-terra-fast"][0]["total_tokens"], 2200)
+        self.assertEqual(tier["by_mode"]["Normal"]["by_model"]["gpt-5.6-terra-fast"][0]["total_tokens"], 0)
         self.assertEqual(sum(ws[0]["conversations"] for ws in tier["by_model"].values()), 3)
         for i, total in enumerate(r["windows"]):
             tiers = [g["windows"][i] for g in r["by_tier"].values()]
@@ -895,7 +1054,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(mixed["windows"][0]["total_tokens"], 0)
         self.assertEqual(mixed["by_mode"]["Mixed modes (timing)"]["windows"][0]["metrics"]["throughput"]["avg"], 20)
         self.assertEqual(r["by_tier"]["High"]["by_mode"]["Fast"]["windows"][0]["cost"],
-                         r["by_model"]["gpt-6-astra"][0]["cost"])
+                         r["by_model"]["gpt-6-astra-fast"][0]["cost"])
 
     def test_tier_unclassified_empty_and_calendar_boundary_windows(self):
         midnight = metrics.make_windows(NOW)[0].start
@@ -1119,6 +1278,31 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(metrics.router_model("claude-haiku-4-5-20251001", prices), "anthropic/claude-haiku-4.5")
         self.assertEqual(metrics.model_tier("Claude Haiku 4.5"), metrics.ModelTier.BUDGET)
         self.assertEqual(metrics.model_tier("anthropic/claude-sonnet-4.6"), metrics.ModelTier.MEDIUM)
+
+    def test_long_catalog_entries_keep_original_identity_and_unpriced_fast_usage(self):
+        prices = self.catalog()
+        for count, long_context in [(999, False), (1000, True), (2000, True)]:
+            for speed in [metrics.SpeedMode.NORMAL, metrics.SpeedMode.FAST]:
+                with self.subTest(count=count, speed=speed):
+                    rows = prefix(model="vendor/new-model")
+                    rows[0]["payload"]["service_tier"] = "priority" if speed == metrics.SpeedMode.FAST else "default"
+                    self.write(rows + [modern(counts=usage(input=count)), complete()], "codex/session.jsonl")
+                    report = metrics.collect_report(self.root, NOW, catalog=prices)
+                    name = "vendor/new-model" + ("-fast" if speed == metrics.SpeedMode.FAST else "")
+                    name += "-long" if long_context else ""
+                    self.assertEqual(set(report["by_model"]), {name})
+                    self.assertEqual(report["openrouter_rates"][name]["id"], "vendor/new-model")
+                    window = report["by_model"][name][0]
+                    self.assertEqual(window["total_tokens"], count + 100)
+                    costs, missing = metrics.price_usage("vendor/new-model", metrics.Usage(count, 100, 400, 20),
+                                                        speed, prices)
+                    self.assertEqual(Decimal(window["cost"]), sum(costs.values(), Decimal(0)))
+                    self.assertEqual(window["unpriced_tokens"], sum(missing.values()))
+                    self.assertEqual(window["unpriced"], {name: count + 100} if missing else {})
+        self.assertFalse(metrics.is_long_context("vendor/new-model", metrics.Usage(2000, 0), prices, aggregate=True))
+        costs, missing = metrics.price_usage("vendor/new-model", metrics.Usage(2000, 0), catalog=prices, aggregate=True)
+        self.assertEqual(sum(costs.values(), Decimal(0)), 0)
+        self.assertEqual(sum(missing.values()), 2000)
 
     def test_claude_fast_is_not_charged_codex_multiplier(self):
         normal, _ = metrics.price_usage("claude-opus-5-5", metrics.Usage(100, 10))
