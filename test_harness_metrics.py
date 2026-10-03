@@ -66,6 +66,9 @@ class ReportTests(unittest.TestCase):
         self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        home = patch("harness_metrics.Path.home", return_value=self.root / "home")
+        home.start()
+        self.addCleanup(home.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -640,6 +643,200 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(r["quality"]["Malformed records"], 1)
         self.assertEqual(r["quality"]["Invalid usage records"], 1)
 
+    def test_trend_periods_partition_history_and_include_cutoff_once(self):
+        cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        windows = metrics.make_trend_windows(cutoff, timezone.utc, start=cutoff - timedelta(days=365))
+        lookup = metrics.WindowLookup(windows)
+        for granularity in metrics.Granularity:
+            periods = [w for w in windows if w.granularity == granularity]
+            self.assertEqual(periods[0].start, cutoff - timedelta(days=365))
+            self.assertEqual(periods[-1].end, cutoff)
+            self.assertFalse(periods[-1].end_exclusive)
+            for previous, following in zip(periods, periods[1:]):
+                self.assertEqual(previous.end, following.start)
+                self.assertTrue(previous.end_exclusive)
+                self.assertEqual(sum(windows[i].granularity == granularity
+                                     for i in lookup.matching(following.start)), 1)
+            self.assertEqual(sum(w.contains(cutoff) for w in periods), 1)
+            self.assertEqual(sum(w.contains(cutoff - timedelta(days=365)) for w in periods), 1)
+        monthly = [w for w in windows if w.granularity == metrics.Granularity.MONTHLY]
+        self.assertEqual(monthly[-2].label, "2025-12-01")
+        self.assertEqual(monthly[-1].label, "2026-01-01")
+
+    def test_trend_calendar_days_handle_dst_and_leap_month(self):
+        leap = metrics.make_trend_windows(datetime(2024, 3, 2, tzinfo=timezone.utc), timezone.utc,
+                                          start=datetime(2024, 2, 1, tzinfo=timezone.utc))
+        february = next(w for w in leap if w.granularity == metrics.Granularity.MONTHLY
+                        and w.label == "2024-02-01")
+        self.assertEqual(february.end - february.start, timedelta(days=29))
+        try:
+            toronto = metrics.ZoneInfo("America/Toronto")
+        except metrics.ZoneInfoNotFoundError:
+            self.skipTest("Toronto timezone data unavailable")
+        periods = metrics.make_trend_windows(datetime(2026, 11, 3, tzinfo=timezone.utc), toronto,
+                                            start=datetime(2026, 3, 1, tzinfo=timezone.utc))
+        daily = {w.label: w for w in periods if w.granularity == metrics.Granularity.DAILY}
+        self.assertEqual(daily["2026-03-08"].end - daily["2026-03-08"].start, timedelta(hours=23))
+        self.assertEqual(daily["2026-11-01"].end - daily["2026-11-01"].start, timedelta(hours=25))
+        for w in periods:
+            if w.granularity == metrics.Granularity.WEEKLY:
+                self.assertEqual(datetime.fromisoformat(w.label).weekday(), 0)
+
+    def test_trends_use_period_samples_and_conversations_with_filters(self):
+        cutoff = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
+        starts = [datetime(2026, 10, day, 10, tzinfo=timezone.utc) for day in (5, 6)]
+        turns = {}
+        calls = {}
+        for index, (start, duration, ttft) in enumerate(zip(starts, (10, 30), (1, 3))):
+            turn = metrics.Turn(str(index), start=start, end=start + timedelta(seconds=duration),
+                                duration=duration, ttft=ttft, model="gpt-6.1-sol", completed=True,
+                                modern=[metrics.UsageEvent(start, metrics.Usage(100, 100),
+                                                           "gpt-6.1-sol", str(index))])
+            turns[turn.id] = turn
+            calls[str(index)] = metrics.ToolCall(start, turn.id, turn.model)
+        other = metrics.Turn("other", start=starts[1], end=starts[1] + timedelta(seconds=20),
+                             duration=20, ttft=5, model="gpt-6-astra", completed=True,
+                             mode=metrics.SpeedMode.FAST,
+                             modern=[metrics.UsageEvent(starts[1], metrics.Usage(100, 100),
+                                                        "gpt-6-astra", "other", mode=metrics.SpeedMode.FAST)])
+        report = metrics.build_breakdown([metrics.Thread("one", turns=turns, calls=calls),
+                                          metrics.Thread("two", turns={other.id: other})],
+                                         cutoff, report_zone=timezone.utc)
+        def point(scope, granularity, label):
+            index = next(i for i, p in enumerate(report["trend_periods"][granularity])
+                         if p["label"] == label)
+            return scope["trends"][granularity][index]
+
+        weekly = point(report, "weekly", "2026-10-05")
+        self.assertEqual(weekly["ttft"]["count"], 3)
+        self.assertEqual(weekly["ttft"]["avg"], 3)
+        self.assertEqual(weekly["length"]["avg"], 30)
+        self.assertEqual(weekly["tools"]["avg"], 1)
+        self.assertAlmostEqual(weekly["throughput"]["avg"], (10 + 100 / 30 + 5) / 3)
+        self.assertEqual(point(report, "daily", "2026-10-06")["ttft"]["avg"], 4)
+        self.assertEqual(point(report, "hourly", "2026-10-06T10:00+00:00")["ttft"]["avg"], 4)
+        self.assertEqual(point(report, "monthly", "2026-10-01")["length"]["avg"], 30)
+        self.assertIsNone(point(report, "daily", "2026-10-07"))
+        normal = report["by_mode"]["Normal"]
+        self.assertEqual(point(normal, "weekly", "2026-10-05")["length"]["avg"], 40)
+        high_fast = report["by_tier"]["High"]["by_mode"]["Fast"]
+        self.assertEqual(point(high_fast, "weekly", "2026-10-05")["ttft"]["avg"], 5)
+        self.assertEqual(point(high_fast, "hourly", "2026-10-06T10:00+00:00")["ttft"]["avg"], 5)
+        index = next(i for i, p in enumerate(report["trend_periods"]["weekly"])
+                     if p["label"] == "2026-10-05")
+        self.assertEqual(normal["by_model_trends"]["gpt-6.1-sol"]["weekly"][index]["tools"]["avg"], 2)
+
+    def test_hourly_trends_assign_crossing_turn_and_calls_to_exact_hour(self):
+        boundary = datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
+        start = boundary - timedelta(minutes=2)
+        turn = metrics.Turn("crossing", start=start, end=boundary, completed=True,
+                            duration=120, ttft=2, model="gpt-6.1-sol",
+                            modern=[metrics.UsageEvent(start, metrics.Usage(100, 240),
+                                                       "gpt-6.1-sol", "response")])
+        thread = metrics.Thread("one", turns={turn.id: turn},
+                                calls={"call": metrics.ToolCall(boundary, turn.id, turn.model)})
+        report = metrics.build_breakdown([thread], boundary + timedelta(hours=2), report_zone=timezone.utc)
+        periods = report["trend_periods"]["hourly"]
+        points = dict(zip((p["label"] for p in periods), report["trends"]["hourly"]))
+        self.assertEqual(points["2026-10-03T09:00+00:00"]["ttft"]["count"], 0)
+        completed = points["2026-10-03T10:00+00:00"]
+        self.assertEqual(completed["ttft"]["avg"], 2)
+        self.assertEqual(completed["throughput"]["avg"], 2)
+        self.assertEqual(completed["length"]["avg"], 120)
+        self.assertEqual(completed["tools"]["avg"], 1)
+        self.assertIsNone(points["2026-10-03T11:00+00:00"])
+        self.assertEqual(periods[-1]["start"], periods[-1]["end"])
+        self.assertFalse(periods[-1]["end_exclusive"])
+        self.assertIn('<option value="hourly">Hourly</option>', metrics.render_report(
+            {**report, "generated": boundary.isoformat()}))
+
+    def test_hourly_trends_preserve_dst_skipped_and_repeated_hours(self):
+        try:
+            toronto = metrics.ZoneInfo("America/Toronto")
+        except metrics.ZoneInfoNotFoundError:
+            self.skipTest("Toronto timezone data unavailable")
+        for month, day, expected in ((3, 8, 23), (11, 1, 25)):
+            start = datetime(2026, month, day, tzinfo=toronto)
+            end = start + timedelta(days=1)
+            periods = [w for w in metrics.make_trend_windows(end.astimezone(timezone.utc), toronto, start)
+                       if w.granularity == metrics.Granularity.HOURLY and w.start < w.end]
+            self.assertEqual(len(periods), expected)
+            self.assertTrue(all(w.end - w.start == timedelta(hours=1) for w in periods))
+            self.assertEqual(len({w.label for w in periods}), expected)
+            if month == 3:
+                self.assertFalse(any("T02:00" in w.label for w in periods))
+            else:
+                self.assertEqual([w.label for w in periods if "T01:00" in w.label],
+                                 ["2026-11-01T01:00-04:00", "2026-11-01T01:00-05:00"])
+        turns = {}
+        for hour, ttft in ((5, 1), (6, 3)):
+            at = datetime(2026, 11, 1, hour, 10, tzinfo=timezone.utc)
+            turns[str(hour)] = metrics.Turn(str(hour), start=at, end=at + timedelta(seconds=10),
+                                            completed=True, duration=10, ttft=ttft)
+        report = metrics.build_breakdown([metrics.Thread("one", turns=turns)],
+                                         datetime(2026, 11, 1, 8, tzinfo=timezone.utc), report_zone=toronto)
+        repeated = [(p["label"], point["ttft"]["avg"]) for p, point in
+                    zip(report["trend_periods"]["hourly"], report["trends"]["hourly"])
+                    if "T01:00" in p["label"]]
+        self.assertEqual(repeated, [("2026-11-01T01:00-04:00", 1), ("2026-11-01T01:00-05:00", 3)])
+
+    def test_hourly_empty_buckets_share_storage_without_leaking_between_filters(self):
+        cutoff = datetime(2026, 10, 3, 12, tzinfo=timezone.utc)
+        periods = metrics.make_windows(cutoff, timezone.utc) + metrics.make_trend_windows(cutoff, timezone.utc)
+        first, second, overall = (metrics.empty_breakdown(periods) for _ in range(3))
+        index = next(i for i, w in enumerate(periods) if w.granularity == metrics.Granularity.HOURLY)
+        self.assertIs(first.windows[index], second.windows[index])
+        self.assertIs(first.windows[index], first.by_mode[metrics.SpeedMode.FAST].windows[index])
+        at = periods[index].start + timedelta(minutes=10)
+        thread = metrics.Thread("one", turns={"t": metrics.Turn(
+            "t", start=at, end=at + timedelta(seconds=10), completed=True,
+            duration=10, ttft=1, model="gpt-6.1-sol")},
+            billing=[metrics.BillingEvent(at, "USD", Decimal(1))])
+        metrics.add_thread(first.windows, thread, first.by_model, first.by_mode, first.by_tier)
+        self.assertIsNot(first.windows[index], second.windows[index])
+        self.assertEqual(first.windows[index].ttft, [1])
+        self.assertEqual(second.windows[index].ttft, [])
+        self.assertEqual(second.windows[index].billing, {})
+        self.assertEqual(first.by_mode[metrics.SpeedMode.FAST].windows[index].ttft, [])
+        metrics.merge_breakdown(overall, first)
+        metrics.merge_breakdown(overall, second)
+        self.assertEqual(overall.windows[index].ttft, [1])
+        self.assertEqual(overall.by_model["gpt-6.1-sol"][index].ttft, [1])
+        self.assertEqual(overall.windows[index].billing["USD"], Decimal(1))
+        self.assertEqual(second.windows[index].ttft, [])
+
+    def test_trend_history_starts_at_first_datapoint_beyond_one_year(self):
+        oldest = datetime(2023, 4, 12, 14, tzinfo=timezone.utc)
+        self.write(prefix(thread="old", at=oldest) + [modern(at=oldest + timedelta(seconds=1)),
+                                                     complete(at=oldest + timedelta(seconds=10))], "old.jsonl")
+        self.write(prefix(thread="new") + [modern(), complete()], "new.jsonl")
+        report = self.report()
+        for granularity, periods in report["trend_periods"].items():
+            self.assertEqual(periods[0]["start"][:10], "2023-04-12")
+            self.assertEqual(periods[-1]["end"], report["generated"])
+            first_point = next(point for point in report["trends"][granularity]
+                               if point and point["ttft"]["count"])
+            self.assertEqual(first_point["ttft"]["count"], 1)
+        self.assertEqual(report["windows"][0]["total_tokens"], 1100)
+        self.assertEqual(report["windows"][-1]["total_tokens"], 1100)
+        html = metrics.render_report(report)
+        self.assertIn('id="trend-start"', html)
+        self.assertIn('id="trend-end"', html)
+        self.assertNotIn("Past 365 days", html)
+
+    def test_trend_start_uses_local_date_and_ignores_future_and_billing_only_activity(self):
+        at = datetime(2026, 9, 20, 2, tzinfo=timezone.utc)
+        turn = metrics.Turn("early", start=at, end=at + timedelta(seconds=10), completed=True, duration=10)
+        future = metrics.Turn("future", start=NOW + timedelta(days=1))
+        thread = metrics.Thread("one", turns={turn.id: turn, future.id: future},
+                                billing=[metrics.BillingEvent(at - timedelta(days=1000), "USD", Decimal(1))])
+        report = metrics.build_breakdown([thread], NOW)
+        expected_date = at.astimezone(metrics.TIMEZONE).date().isoformat()
+        self.assertEqual(report["trend_periods"]["daily"][0]["start"][:10], expected_date)
+        empty = metrics.build_breakdown([], NOW)
+        self.assertEqual(len(empty["trend_periods"]["daily"]), 1)
+        self.assertIsNone(empty["trends"]["daily"][0])
+
     def test_empty_report_and_safe_offline_html(self):
         r = self.report()
         self.assertEqual(r["files"], 0)
@@ -1145,6 +1342,166 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(by_label["Last 60 days"]["active_seconds"], 10)
 
 
+class CacheTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "logs"
+        self.root.mkdir()
+        self.cache = Path(self.temp.name) / "cache" / "metrics.sqlite3"
+
+    def write(self, name, rows):
+        path = self.root / name
+        path.write_text("\n".join(json.dumps(r) if isinstance(r, dict) else r for r in rows) + "\n")
+        return path
+
+    def report(self, **kwargs):
+        return metrics.collect_report(self.root, NOW, cache_path=self.cache, **kwargs)
+
+    def test_cache_skips_parsing_and_identity_reads_and_appends_new_conversations(self):
+        self.write("one.jsonl", prefix(thread="one") + [modern(), complete()])
+        expected = metrics.collect_report(self.root, NOW)
+        self.assertEqual(self.report(), expected)
+        with patch("harness_metrics.read_thread", wraps=metrics.read_thread) as read, \
+             patch("harness_metrics.session_identity", wraps=metrics.session_identity) as identity:
+            self.assertEqual(self.report(), expected)
+            self.assertEqual(read.call_count, 0)
+            self.assertEqual(identity.call_count, 0)
+            self.write("two.jsonl", prefix(thread="two") + [modern(), complete()])
+            updated = self.report()
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(identity.call_count, 1)
+            self.assertEqual(updated["threads"], 2)
+            self.assertEqual(updated["windows"][0]["total_tokens"], 2200)
+        self.assertEqual(updated, metrics.collect_report(self.root, NOW))
+
+    def test_cache_refreshes_appended_turns_and_rewritten_files_without_duplicates(self):
+        path = self.write("one.jsonl", prefix() + [modern(), complete()])
+        self.report()
+        more = prefix(turn="t2")[1:] + [modern("t2", "r2"), complete("t2")]
+        with path.open("a") as stream:
+            stream.write("\n".join(json.dumps(r) for r in more) + "\n")
+        self.assertEqual(self.report()["windows"][0]["total_tokens"], 2200)
+        self.assertEqual(self.report(), metrics.collect_report(self.root, NOW))
+        self.write("one.jsonl", prefix() + [modern(counts=usage(input=2000)), complete()])
+        self.assertEqual(self.report()["windows"][0]["total_tokens"], 2100)
+        self.assertEqual(self.report(), metrics.collect_report(self.root, NOW))
+
+    def test_cache_merges_copies_and_handles_removed_files_and_source_scope(self):
+        rows = prefix() + [modern(), complete()]
+        original = self.write("one.jsonl", rows)
+        self.report()
+        self.write("copy.jsonl", rows)
+        self.assertEqual(self.report()["windows"][0]["total_tokens"], 1100)
+        original.unlink()
+        self.assertEqual(self.report(), metrics.collect_report(self.root, NOW))
+        other = self.root / "other"
+        other.mkdir()
+        self.assertEqual(metrics.collect_report(other, NOW, cache_path=self.cache)["threads"], 0)
+        (self.root / "copy.jsonl").unlink()
+        self.assertEqual(self.report()["threads"], 0)
+
+    def test_cache_preserves_diagnostics_and_recomputes_cutoff_timezone_and_prices(self):
+        self.write("one.jsonl", prefix() + ['{bad', modern(), complete()])
+        self.report()
+        self.assertEqual(self.report(), metrics.collect_report(self.root, NOW))
+        future = NOW + timedelta(days=7)
+        self.assertEqual(metrics.collect_report(self.root, future, cache_path=self.cache, report_zone=timezone.utc),
+                         metrics.collect_report(self.root, future, report_zone=timezone.utc))
+        rates = metrics.Rates(Decimal("20"), Decimal("10"), Decimal("100"))
+        with patch.dict(metrics.PRICES, {"gpt-6.1-sol": metrics.Price(rates)}):
+            self.assertEqual(self.report(), metrics.collect_report(self.root, NOW))
+
+    def test_cached_trend_start_includes_old_selected_sources_only(self):
+        old = datetime(2022, 5, 8, 12, tzinfo=timezone.utc)
+        self.write("old.jsonl", prefix(thread="old", at=old) + [modern(at=old), complete(at=old)])
+        self.write("new.jsonl", prefix(thread="new") + [modern(), complete()])
+        expected = metrics.collect_report(self.root, NOW)
+        self.assertEqual(self.report(), expected)
+        with patch("harness_metrics.read_thread", side_effect=AssertionError("old logs parsed")):
+            self.assertEqual(self.report(), expected)
+        (self.root / "old.jsonl").unlink()
+        self.assertEqual(self.report()["trend_periods"]["daily"][0]["start"][:10],
+                         START.astimezone(metrics.TIMEZONE).date().isoformat())
+
+    def test_cache_does_not_store_files_that_change_while_being_parsed(self):
+        path = self.write("one.jsonl", prefix() + [modern(), complete()])
+        original = metrics.read_thread
+        def growing(thread_id, paths, quality):
+            thread = original(thread_id, paths, quality)
+            with path.open("a") as stream:
+                stream.write(json.dumps(modern(response="r2")) + "\n")
+            return thread
+        with patch("harness_metrics.read_thread", growing):
+            self.report()
+        with patch("harness_metrics.read_thread", wraps=original) as read:
+            report = self.report()
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(report["windows"][0]["total_tokens"], 2200)
+        self.assertEqual(self.report(), metrics.collect_report(self.root, NOW))
+
+    def test_cli_cache_options_enable_reuse_and_allow_bypass(self):
+        self.write("one.jsonl", prefix() + [modern(), complete()])
+        output = Path(self.temp.name) / "report.html"
+        base = ["harness_metrics.py", str(self.root), "--offline", "--output", str(output)]
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with patch("sys.argv", base + ["--cache", str(self.cache)]):
+                self.assertEqual(metrics.main(), 0)
+            with patch("sys.argv", base + ["--cache", str(self.cache)]), \
+                 patch("harness_metrics.read_thread", wraps=metrics.read_thread) as read:
+                self.assertEqual(metrics.main(), 0)
+                self.assertEqual(read.call_count, 0)
+            with patch("sys.argv", base + ["--no-cache"]), \
+                 patch("harness_metrics.sqlite3.connect", wraps=sqlite3.connect) as connections:
+                self.assertEqual(metrics.main(), 0)
+                self.assertTrue(all(Path(call.args[0]) != self.cache for call in connections.call_args_list))
+
+    def test_cache_rejects_unrelated_existing_database_without_changes(self):
+        self.cache.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(self.cache)) as connection, connection:
+            connection.execute("CREATE TABLE unrelated (value TEXT)")
+            connection.execute("INSERT INTO unrelated VALUES ('preserve')")
+            connection.execute("PRAGMA user_version=1")
+        original = self.cache.read_bytes()
+        with self.assertRaisesRegex(ValueError, "different database"):
+            self.report()
+        self.assertEqual(self.cache.read_bytes(), original)
+
+    def test_bucket_lookup_matches_exact_boundaries_and_crossing_turns(self):
+        periods = metrics.make_windows(NOW, timezone.utc) + metrics.make_trend_windows(
+            NOW, timezone.utc, start=NOW - timedelta(days=1000))
+        lookup = metrics.WindowLookup(periods)
+        timestamps = {NOW, NOW + timedelta(seconds=1), NOW - timedelta(days=366)}
+        sampled = periods[::max(1, len(periods) // 40)] + periods[:12] + periods[-12:]
+        for period in sampled:
+            timestamps.update((period.start, period.end, period.start - timedelta(microseconds=1)))
+        for at in timestamps:
+            self.assertEqual(sorted(lookup.matching(at)),
+                             [i for i, window in enumerate(periods) if window.contains(at)])
+
+    def test_aggregation_boundary_checks_do_not_scale_with_history_bucket_count(self):
+        at = NOW - timedelta(seconds=20)
+        turn = metrics.Turn("t", start=at, end=NOW, model="gpt-6.1-sol", completed=True,
+                            duration=20, ttft=.5,
+                            modern=[metrics.UsageEvent(at, metrics.Usage(1000, 100), "gpt-6.1-sol", "r")])
+        thread = metrics.Thread("one", turns={turn.id: turn},
+                                calls={"call": metrics.ToolCall(at, turn.id, turn.model)})
+        old_at = NOW - timedelta(days=1000)
+        old = metrics.Thread("old", turns={"old": metrics.Turn(
+            "old", start=old_at, end=old_at + timedelta(seconds=20), model=turn.model,
+            completed=True, duration=20, ttft=.5)})
+        contains = metrics.Window.contains
+        checks = []
+        def counted(window, timestamp):
+            checks.append(timestamp)
+            return contains(window, timestamp)
+        with patch.object(metrics.Window, "contains", counted):
+            result = metrics.build_breakdown([old, thread], NOW)
+        self.assertLess(len(checks), 400)
+        self.assertGreater(len(result["trend_periods"]["daily"]), 1000)
+        self.assertEqual(result["windows"][0]["total_tokens"], 1100)
+
+
 class HarnessTests(unittest.TestCase):
     def setUp(self):
         clock = patch("harness_metrics.datetime", wraps=datetime)
@@ -1155,6 +1512,9 @@ class HarnessTests(unittest.TestCase):
         self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        home = patch("harness_metrics.Path.home", return_value=self.root / "home")
+        home.start()
+        self.addCleanup(home.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -1197,6 +1557,54 @@ class HarnessTests(unittest.TestCase):
             {"id": "anthropic/claude-haiku-4.5", "pricing": {"prompt": ".000001", "completion": ".000005", "input_cache_read": ".0000001"}},
             {"id": "vendor/new-model", "pricing": {"prompt": ".000002", "completion": ".000010", "input_cache_read": ".0000002", "input_cache_write": ".0000025", "input_cache_write_1h": ".000004",
                     "overrides": [{"min_prompt_tokens": 1000, "prompt": ".000004"}, {"min_prompt_tokens": 2000, "prompt": ".000008"}]}}]})
+
+    def test_sqlite_cache_reuses_all_harness_readers_and_preserves_metrics(self):
+        self.write(prefix() + [modern(), complete()], "codex/session.jsonl")
+        self.write([self.claude()], "claude/session.jsonl")
+        self.write([self.copilot("session.start", "start", {"sessionId": "copilot"}),
+                    self.copilot("assistant.usage", "usage", {"model": "gpt-6.1-sol", "inputTokens": 100,
+                                                              "outputTokens": 10})], "copilot/events.jsonl")
+        sources = {metrics.Harness.CLAUDE: [self.root / "claude"],
+                   metrics.Harness.COPILOT: [self.root / "copilot"],
+                   metrics.Harness.OPENCODE: [self.opencode_db()]}
+        cache = self.root / "cache.sqlite3"
+        expected = self.report(sources)
+        cached = metrics.collect_report(self.root / "codex", NOW, harness_roots=sources, cache_path=cache)
+        self.assertEqual(cached, expected)
+        with patch("harness_metrics.read_thread", side_effect=AssertionError("Codex parsed")), \
+             patch("harness_metrics.read_claude", side_effect=AssertionError("Claude parsed")), \
+             patch("harness_metrics.read_copilot", side_effect=AssertionError("Copilot parsed")), \
+             patch("harness_metrics.read_opencode", side_effect=AssertionError("OpenCode parsed")):
+            warm = metrics.collect_report(self.root / "codex", NOW, harness_roots=sources, cache_path=cache)
+        self.assertEqual(warm, expected)
+        self.assertNotIn(b"private text", cache.read_bytes())
+
+    def test_sqlite_cache_invalidates_on_opencode_wal_changes(self):
+        path = self.opencode_db()
+        cache = self.root / "metrics.sqlite3"
+        sources = {metrics.Harness.OPENCODE: [path]}
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.commit()
+            report = metrics.collect_report(self.root, NOW, harness_roots=sources, include_codex=False, cache_path=cache)
+            row = connection.execute("SELECT data FROM message WHERE id='m1'").fetchone()
+            data = json.loads(row[0])
+            data["tokens"]["input"] = 300
+            connection.execute("UPDATE message SET data=? WHERE id='m1'", (json.dumps(data),))
+            connection.commit()
+            with patch("harness_metrics.read_opencode", wraps=metrics.read_opencode) as read:
+                updated = metrics.collect_report(self.root, NOW, harness_roots=sources, include_codex=False, cache_path=cache)
+                self.assertEqual(read.call_count, 1)
+            self.assertEqual(updated["windows"][0]["total_tokens"], report["windows"][0]["total_tokens"] + 200)
+            self.assertEqual(updated, metrics.collect_report(self.root, NOW, harness_roots=sources, include_codex=False))
+
+    def test_sqlite_cache_cannot_write_to_harness_database(self):
+        path = self.opencode_db()
+        original = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "separate from harness storage"):
+            metrics.collect_report(self.root, NOW, harness_roots={metrics.Harness.OPENCODE: [path]}, cache_path=path)
+        self.assertEqual(path.read_bytes(), original)
 
     def test_claude_cache_normalization_streaming_and_copy_deduplication(self):
         rows = [{"type": "user", "sessionId": "same-id", "uuid": "user1", "timestamp": START.isoformat(), "message": {"content": "private text"}},

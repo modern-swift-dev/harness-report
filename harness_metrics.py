@@ -16,8 +16,9 @@ Local storage is read only; costs are API estimates, not subscription bills.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from collections import Counter, defaultdict
-from contextlib import closing
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal, InvalidOperation
@@ -31,7 +32,8 @@ import re
 import sqlite3
 import statistics
 import sys
-from typing import Any, Iterable
+import tempfile
+from typing import Any, Iterable, Iterator
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -961,12 +963,20 @@ def read_opencode(paths: list[Path], quality: Quality) -> list[Thread]:
     return list(threads.values())
 
 
+class Granularity(str, Enum):
+    HOURLY = "hourly"
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+
+
 @dataclass
 class Window:
     label: str
     start: datetime
     end: datetime
     end_exclusive: bool = False
+    granularity: Granularity | None = None
     conversations: set[str] = field(default_factory=set)
     durations: dict[str, float] = field(default_factory=dict)
     call_counts: Counter[str] = field(default_factory=Counter)
@@ -979,6 +989,7 @@ class Window:
     models: Counter[str] = field(default_factory=Counter)
     coverage: Counter[str] = field(default_factory=Counter)
     billing: dict[str, Decimal] = field(default_factory=lambda: defaultdict(Decimal))
+    shared_empty: bool = False
 
     def contains(self, at: datetime) -> bool:
         return self.start <= at and (at < self.end if self.end_exclusive else at <= self.end)
@@ -993,6 +1004,57 @@ def make_windows(now: datetime, report_zone: tzinfo = TIMEZONE) -> list[Window]:
             Window("Yesterday", yesterday, today, end_exclusive=True)] + [
         Window(f"Last {days} days", now - timedelta(days=days), now)
         for days in (7, 14, 30, 60, 90, 180, 365)]
+
+
+def make_trend_windows(now: datetime, report_zone: tzinfo = TIMEZONE,
+                       start: datetime | None = None) -> list[Window]:
+    midnight = (start or now).astimezone(report_zone).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = midnight.astimezone(timezone.utc)
+    windows: list[Window] = []
+    for granularity in Granularity:
+        cursor = midnight
+        if granularity == Granularity.WEEKLY:
+            cursor -= timedelta(days=cursor.weekday())
+        elif granularity == Granularity.MONTHLY:
+            cursor = cursor.replace(day=1)
+        while cursor.astimezone(timezone.utc) <= now:
+            if granularity == Granularity.HOURLY:
+                # Step in UTC so repeated and skipped local hours remain distinct.
+                following = (cursor.astimezone(timezone.utc) + timedelta(hours=1)).astimezone(report_zone)
+            elif granularity == Granularity.MONTHLY:
+                following = (cursor.replace(year=cursor.year + 1, month=1) if cursor.month == 12
+                             else cursor.replace(month=cursor.month + 1))
+            else:
+                following = cursor + timedelta(days=7 if granularity == Granularity.WEEKLY else 1)
+            end = min(following.astimezone(timezone.utc), now)
+            label = cursor.isoformat(timespec="minutes") if granularity == Granularity.HOURLY else cursor.date().isoformat()
+            windows.append(Window(label, max(cursor.astimezone(timezone.utc), start),
+                                  end, end_exclusive=following.astimezone(timezone.utc) <= now,
+                                  granularity=granularity, shared_empty=granularity == Granularity.HOURLY))
+            cursor = following
+    return windows
+
+
+class WindowLookup:
+    """Find the few applicable buckets instead of scanning every calendar period."""
+
+    def __init__(self, windows: list[Window]) -> None:
+        self.windows = windows
+        self.reporting = [i for i, w in enumerate(windows) if w.granularity is None]
+        self.indices = {g: [i for i, w in enumerate(windows) if w.granularity == g]
+                        for g in Granularity}
+        self.starts = {g: [windows[i].start for i in indices]
+                       for g, indices in self.indices.items()}
+
+    def matching(self, at: datetime) -> list[int]:
+        result = [i for i in self.reporting if self.windows[i].contains(at)]
+        for granularity, starts in self.starts.items():
+            position = bisect_right(starts, at) - 1
+            if position >= 0:
+                index = self.indices[granularity][position]
+                if self.windows[index].contains(at):
+                    result.append(index)
+        return result
 
 
 @dataclass
@@ -1017,7 +1079,20 @@ class Breakdown:
 
 
 def empty_windows(windows: list[Window]) -> list[Window]:
-    return [Window(w.label, w.start, w.end, end_exclusive=w.end_exclusive) for w in windows]
+    # Hourly history can contain tens of thousands of empty buckets per filter.
+    # Share their boundaries until a scope actually receives samples.
+    return [w if w.shared_empty else Window(w.label, w.start, w.end, end_exclusive=w.end_exclusive,
+                                            granularity=w.granularity,
+                                            shared_empty=w.granularity == Granularity.HOURLY) for w in windows]
+
+
+def writable_window(windows: list[Window], index: int) -> Window:
+    window = windows[index]
+    if window.shared_empty:
+        window = Window(window.label, window.start, window.end,
+                        end_exclusive=window.end_exclusive, granularity=window.granularity)
+        windows[index] = window
+    return window
 
 
 def empty_breakdown(windows: list[Window]) -> Breakdown:
@@ -1032,7 +1107,10 @@ def empty_breakdown(windows: list[Window]) -> Breakdown:
 def merge_breakdown(target: Breakdown, source: Breakdown) -> None:
     # Merge raw samples and per-conversation values before computing statistics.
     def merge_windows(destination: list[Window], incoming: list[Window]) -> None:
-        for window, other in zip(destination, incoming):
+        for index, other in enumerate(incoming):
+            if other.shared_empty:
+                continue
+            window = writable_window(destination, index)
             window.conversations.update(other.conversations)
             for conversation, duration in other.durations.items():
                 window.durations[conversation] = window.durations.get(conversation, 0) + duration
@@ -1078,22 +1156,26 @@ def add_thread(windows: list[Window], thread: Thread,
                by_model: dict[str, list[Window]] | None = None,
                by_mode: dict[SpeedMode, ModeBreakdown] | None = None,
                by_tier: dict[ModelTier, TierBreakdown] | None = None,
-               catalog: dict[str, Price] | None = None) -> None:
+               catalog: dict[str, Price] | None = None,
+               lookup: WindowLookup | None = None) -> None:
+    lookup = lookup or WindowLookup(windows)
+
     def targets(model: str | None, mode: SpeedMode, tier: ModelTier,
-                long_context: bool = False) -> list[Window]:
-        result = list(windows)
+                long_context: bool = False, at_times: Iterable[datetime] = ()) -> list[Window]:
+        indices = sorted({i for at in at_times for i in lookup.matching(at)})
+        result = [writable_window(windows, i) for i in indices]
         name = report_model(model, mode, long_context)
         if by_model is not None:
             if name not in by_model:
                 by_model[name] = empty_windows(windows)
-            result += by_model[name]
+            result += [writable_window(by_model[name], i) for i in indices]
         if by_mode is not None:
             if mode not in by_mode:
                 by_mode[mode] = ModeBreakdown(empty_windows(windows))
             group = by_mode[mode]
             if name not in group.by_model:
                 group.by_model[name] = empty_windows(windows)
-            result += group.windows + group.by_model[name]
+            result += [writable_window(ws, i) for ws in (group.windows, group.by_model[name]) for i in indices]
         if by_tier is not None:
             if tier not in by_tier:
                 by_tier[tier] = TierBreakdown(empty_windows(windows))
@@ -1105,8 +1187,8 @@ def add_thread(windows: list[Window], thread: Thread,
             mode_group = tier_group.by_mode[mode]
             if name not in mode_group.by_model:
                 mode_group.by_model[name] = empty_windows(windows)
-            result += (tier_group.windows + tier_group.by_model[name] +
-                       mode_group.windows + mode_group.by_model[name])
+            result += [writable_window(ws, i) for ws in (tier_group.windows, tier_group.by_model[name],
+                                        mode_group.windows, mode_group.by_model[name]) for i in indices]
         return result
 
     # Classify usage once; tool calls in a turn share its model/mode contexts.
@@ -1122,13 +1204,15 @@ def add_thread(windows: list[Window], thread: Thread,
             counts = record.usage.categories()
             usage_total = record.usage.total
             name = report_model(model, record.mode, long_context)
-            costs, unpriced = price_usage(model, record.usage, record.mode, catalog,
-                                          aggregate=record.aggregate)
-            for window in targets(model, record.mode, model_tier(model), long_context):
-                if not window.contains(record.at):
-                    continue
+            record_windows = targets(model, record.mode, model_tier(model), long_context, [record.at])
+            # Trend points need samples and conversation membership, not token/cost breakdowns.
+            costs, unpriced = (price_usage(model, record.usage, record.mode, catalog, aggregate=record.aggregate)
+                               if any(w.granularity is None for w in record_windows) else ({}, {}))
+            for window in record_windows:
                 if usage_total:
                     window.conversations.add(thread.id)
+                if window.granularity is not None:
+                    continue
                 for category, count in counts.items():
                     window.tokens[category] += count
                 window.models[name] += usage_total
@@ -1154,7 +1238,8 @@ def add_thread(windows: list[Window], thread: Thread,
         usage_tiers = {model_tier(r.model or turn.model) for r in usage_events}
         timing_tier = (ModelTier.MIXED if len(usage_tiers) > 1 else
                        next(iter(usage_tiers)) if usage_tiers else model_tier(turn.model))
-        turn_windows = targets(timing_model, timing_mode, timing_tier, usage_contexts == {True})
+        turn_windows = targets(timing_model, timing_mode, timing_tier, usage_contexts == {True},
+                               [at for at in (turn.start, turn.end) if at is not None])
         for window in turn_windows:
             if turn.start and window.contains(turn.start):
                 window.conversations.add(thread.id)
@@ -1187,16 +1272,14 @@ def add_thread(windows: list[Window], thread: Thread,
         model = call.model or (turn.model if turn else None)
         call_contexts = call_contexts_by_usage.get((turn.id, model, call.mode), set()) if turn else set()
         call_model = "Mixed contexts (tools)" if len(call_contexts) > 1 else model
-        for window in targets(call_model, call.mode, model_tier(model), call_contexts == {True}):
-            if window.contains(call.at):
-                window.conversations.add(thread.id)
-                window.call_counts[thread.id] += 1
+        for window in targets(call_model, call.mode, model_tier(model), call_contexts == {True}, [call.at]):
+            window.conversations.add(thread.id)
+            window.call_counts[thread.id] += 1
     # Native billing counters are retained separately from token-rate estimates.
     # Per-model attribution is unavailable for some harness summaries.
     for event in thread.billing:
-        for window in windows:
-            if window.contains(event.at):
-                window.billing[event.unit] += event.amount
+        for window in (writable_window(windows, i) for i in lookup.matching(event.at)):
+            window.billing[event.unit] += event.amount
 
 
 def distribution(values: Iterable[float]) -> dict[str, int | float | None]:
@@ -1209,6 +1292,12 @@ def distribution(values: Iterable[float]) -> dict[str, int | float | None]:
             "p75": ordered[math.ceil(.75 * len(ordered)) - 1],
             "p95": ordered[math.ceil(.95 * len(ordered)) - 1],
             "p99": ordered[math.ceil(.99 * len(ordered)) - 1]}
+
+
+def metric_summary(window: Window) -> dict[str, dict[str, int | float | None]]:
+    return {"ttft": distribution(window.ttft), "throughput": distribution(window.throughput),
+            "length": distribution(window.durations.values()),
+            "tools": distribution(window.call_counts[c] for c in window.conversations)}
 
 
 def summarize(window: Window, report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
@@ -1224,9 +1313,7 @@ def summarize(window: Window, report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
         "active_seconds": sum(window.durations.values()), "tool_calls": sum(window.call_counts.values()),
         "cost": str(sum(window.costs.values(), Decimal(0))),
         "partial_cost": bool(window.unpriced), "unpriced_tokens": sum(window.unpriced.values()),
-        "metrics": {"ttft": distribution(window.ttft), "throughput": distribution(window.throughput),
-                    "length": distribution(window.durations.values()),
-                    "tools": distribution(window.call_counts[c] for c in window.conversations)},
+        "metrics": metric_summary(window),
         "categories": [{"name": c.value, "tokens": window.tokens[c],
                         "cost": str(window.costs[c]), "unpriced_tokens": window.unpriced_categories[c]}
                        for c in categories],
@@ -1236,42 +1323,70 @@ def summarize(window: Window, report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
     }
 
 
+def first_datapoint(thread: Thread, now: datetime) -> datetime | None:
+    times = [at for turn in thread.turns.values() for at in (turn.start, turn.end)
+             if at is not None and at <= now]
+    times.extend(record.at for turn in thread.turns.values() for record in turn.usage
+                 if record.usage.total and record.at <= now)
+    times.extend(call.at for call in thread.calls.values() if call.at <= now)
+    return min(times, default=None)
+
+
 def build_breakdown(threads: Iterable[Thread], now: datetime,
                     catalog: dict[str, Price] | None = None,
                     report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
-    breakdown = empty_breakdown(make_windows(now, report_zone))
+    threads = list(threads)
+    first = min((at for thread in threads if (at := first_datapoint(thread, now)) is not None), default=now)
+    breakdown = empty_breakdown(make_windows(now, report_zone) + make_trend_windows(now, report_zone, first))
+    lookup = WindowLookup(breakdown.windows)
     for thread in threads:
         add_thread(breakdown.windows, thread, breakdown.by_model, breakdown.by_mode,
-                   breakdown.by_tier, catalog)
+                   breakdown.by_tier, catalog, lookup)
     return summarize_breakdown(breakdown, report_zone)
 
 
 def summarize_breakdown(breakdown: Breakdown, report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
     windows = breakdown.windows
-    by_model = breakdown.by_model
-    by_mode = breakdown.by_mode
-    by_tier = breakdown.by_tier
-    active_models = {name: ws for name, ws in sorted(by_model.items()) if any(w.conversations for w in ws)}
+    active_models = {name: ws for name, ws in sorted(breakdown.by_model.items())
+                     if any(w.conversations for w in ws)}
+
+    def summaries(ws: list[Window]) -> list[dict[str, Any]]:
+        return [summarize(w, report_zone) for w in ws if w.granularity is None]
+
+    def trends(ws: list[Window]) -> dict[str, Any]:
+        # Empty periods stay null so the chart can show gaps without repeating empty distributions.
+        return {granularity.value: [metric_summary(w) if w.conversations else None
+                                    for w in ws if w.granularity == granularity]
+                for granularity in Granularity}
+
+    def scope(ws: list[Window], models: dict[str, list[Window]]) -> dict[str, Any]:
+        return {"windows": summaries(ws), "trends": trends(ws),
+                "by_model": {name: summaries(model_windows) for name, model_windows in models.items()},
+                "by_model_trends": {name: trends(model_windows) for name, model_windows in models.items()}}
+
+    def modes(groups: dict[SpeedMode, ModeBreakdown], models: dict[str, list[Window]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for mode in breakdown.by_mode:
+            group = groups.get(mode) or ModeBreakdown(empty_windows(windows))
+            result[mode.value] = scope(group.windows,
+                                      {name: group.by_model.get(name) or empty_windows(windows)
+                                       for name in models})
+        return result
+
     tier_summaries: dict[str, Any] = {}
-    for tier, group in by_tier.items():
-        members = {name: ws for name, ws in sorted(group.by_model.items()) if any(w.conversations for w in ws)}
-        modes: dict[str, Any] = {}
-        for mode in by_mode:
-            mode_group = group.by_mode.get(mode, ModeBreakdown(empty_windows(windows)))
-            modes[mode.value] = {"windows": [summarize(w, report_zone) for w in mode_group.windows],
-                                 "by_model": {name: [summarize(w, report_zone) for w in mode_group.by_model.get(name, empty_windows(windows))]
-                                              for name in members}}
-        tier_summaries[tier.value] = {"windows": [summarize(w, report_zone) for w in group.windows],
-                                     "by_model": {name: [summarize(w, report_zone) for w in ws] for name, ws in members.items()},
-                                     "by_mode": modes}
-    return {"by_tier": tier_summaries,
-            "windows": [summarize(w, report_zone) for w in windows],
-            "by_model": {model: [summarize(w, report_zone) for w in model_windows]
-                         for model, model_windows in active_models.items()},
-            "by_mode": {mode.value: {"windows": [summarize(w, report_zone) for w in group.windows],
-                        "by_model": {model: [summarize(w, report_zone) for w in group.by_model.get(model, empty_windows(windows))]
-                                     for model in active_models}}
-                        for mode, group in by_mode.items()}}
+    for tier, group in breakdown.by_tier.items():
+        members = {name: ws for name, ws in sorted(group.by_model.items())
+                   if any(w.conversations for w in ws)}
+        tier_summaries[tier.value] = scope(group.windows, members)
+        tier_summaries[tier.value]["by_mode"] = modes(group.by_mode, members)
+    result = scope(windows, active_models)
+    result.update({"by_tier": tier_summaries, "by_mode": modes(breakdown.by_mode, active_models),
+                   "trend_periods": {granularity.value: [
+                       {"label": w.label, "start": w.start.astimezone(report_zone).isoformat(),
+                        "end": w.end.astimezone(report_zone).isoformat(), "end_exclusive": w.end_exclusive}
+                       for w in windows if w.granularity == granularity]
+                       for granularity in Granularity}})
+    return result
 
 
 def session_identity(path: Path, harness: Harness) -> str:
@@ -1302,12 +1417,286 @@ def session_identity(path: Path, harness: Harness) -> str:
     return str(identifier)
 
 
+# Bump when the schema or parser semantics change; cached facts must match the readers.
+CACHE_VERSION = 1
+
+
+def file_stamp(path: Path) -> str:
+    stat = path.stat()
+    return json.dumps([stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns])
+
+
+class MetricsCache:
+    """SQLite stores parsed facts, never conversation text or calculated prices."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        connection.execute("PRAGMA foreign_keys=ON")
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, CACHE_VERSION):
+            raise ValueError("unsupported metrics cache version; use a new --cache path or --no-cache")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        cache_tables = {"cache_files", "cache_groups", "cache_threads", "cache_turns", "cache_usage",
+                        "cache_calls", "cache_billing"}
+        if tables and (version == 0 or not cache_tables.issubset(tables)):
+            raise ValueError("cache path contains a different database; choose a separate --cache path")
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS cache_files (
+                harness TEXT NOT NULL, path TEXT NOT NULL, stamp TEXT NOT NULL, identity TEXT NOT NULL,
+                PRIMARY KEY (harness, path));
+            CREATE TABLE IF NOT EXISTS cache_groups (
+                cache_key TEXT PRIMARY KEY, manifest TEXT NOT NULL, counts TEXT NOT NULL, warnings TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS cache_threads (
+                cache_key TEXT NOT NULL, thread_id TEXT NOT NULL, harness TEXT NOT NULL,
+                PRIMARY KEY (cache_key, thread_id),
+                FOREIGN KEY (cache_key) REFERENCES cache_groups ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS cache_turns (
+                cache_key TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                start TEXT, end TEXT, duration REAL, ttft REAL, model TEXT, mode TEXT NOT NULL,
+                completed INTEGER NOT NULL, aborted INTEGER NOT NULL,
+                PRIMARY KEY (cache_key, thread_id, turn_id),
+                FOREIGN KEY (cache_key, thread_id) REFERENCES cache_threads ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS cache_usage (
+                cache_key TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                position INTEGER NOT NULL, at TEXT NOT NULL, model TEXT, event_key TEXT NOT NULL,
+                mode TEXT NOT NULL, aggregate INTEGER NOT NULL,
+                input TEXT NOT NULL, output TEXT NOT NULL, cached TEXT NOT NULL, reasoning TEXT NOT NULL,
+                cache_write TEXT NOT NULL, write_hour TEXT NOT NULL,
+                PRIMARY KEY (cache_key, thread_id, turn_id, position),
+                FOREIGN KEY (cache_key, thread_id, turn_id) REFERENCES cache_turns ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS cache_calls (
+                cache_key TEXT NOT NULL, thread_id TEXT NOT NULL, call_id TEXT NOT NULL,
+                at TEXT NOT NULL, turn_id TEXT NOT NULL, model TEXT, mode TEXT NOT NULL,
+                PRIMARY KEY (cache_key, thread_id, call_id),
+                FOREIGN KEY (cache_key, thread_id) REFERENCES cache_threads ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS cache_billing (
+                cache_key TEXT NOT NULL, thread_id TEXT NOT NULL, position INTEGER NOT NULL,
+                at TEXT NOT NULL, unit TEXT NOT NULL, amount TEXT NOT NULL,
+                PRIMARY KEY (cache_key, thread_id, position),
+                FOREIGN KEY (cache_key, thread_id) REFERENCES cache_threads ON DELETE CASCADE);
+        """)
+        connection.execute(f"PRAGMA user_version={CACHE_VERSION}")
+
+    def identity(self, path: Path, harness: Harness) -> str:
+        stamp = file_stamp(path)
+        row = self.connection.execute(
+            "SELECT stamp, identity FROM cache_files WHERE harness=? AND path=?",
+            (harness.value, str(path))).fetchone()
+        if row and row[0] == stamp:
+            return row[1]
+        identity = session_identity(path, harness)
+        # A growing file must be retried rather than cached under a stale identity.
+        if file_stamp(path) == stamp:
+            self.connection.execute("INSERT OR REPLACE INTO cache_files VALUES (?, ?, ?, ?)",
+                                    (harness.value, str(path), stamp, identity))
+        return identity
+
+    def valid_count(self, key: str, manifest: str) -> int | None:
+        row = self.connection.execute("SELECT manifest FROM cache_groups WHERE cache_key=?", (key,)).fetchone()
+        if row is None or row[0] != manifest:
+            return None
+        return self.connection.execute("SELECT COUNT(*) FROM cache_threads WHERE cache_key=?", (key,)).fetchone()[0]
+
+    def first_datapoint(self, now: datetime) -> datetime | None:
+        # Only the selected source groups participate, including activity older than a year.
+        row = self.connection.execute("""
+            SELECT MIN(at) FROM (
+                SELECT start AS at FROM cache_turns JOIN report_groups USING (cache_key)
+                UNION ALL SELECT end AS at FROM cache_turns JOIN report_groups USING (cache_key)
+                UNION ALL SELECT at FROM cache_usage JOIN report_groups USING (cache_key)
+                    WHERE input != '0' OR output != '0'
+                UNION ALL SELECT at FROM cache_calls JOIN report_groups USING (cache_key)
+            ) WHERE at <= ?
+        """, (now.isoformat(),)).fetchone()
+        return datetime.fromisoformat(row[0]) if row[0] else None
+
+    def load(self, key: str, manifest: str, quality: Quality) -> list[Thread] | None:
+        row = self.connection.execute("SELECT manifest, counts, warnings FROM cache_groups WHERE cache_key=?",
+                                      (key,)).fetchone()
+        if row is None or row[0] != manifest:
+            return None
+        quality.counts.update(json.loads(row[1]))
+        quality.warnings.extend(json.loads(row[2])[:max(0, 20 - len(quality.warnings))])
+        threads = {thread_id: Thread(thread_id, harness=Harness(harness)) for thread_id, harness in
+                   self.connection.execute("SELECT thread_id, harness FROM cache_threads WHERE cache_key=? ORDER BY rowid", (key,))}
+        for row in self.connection.execute(
+                "SELECT thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted "
+                "FROM cache_turns WHERE cache_key=? ORDER BY rowid", (key,)):
+            thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted = row
+            threads[thread_id].turns[turn_id] = Turn(
+                turn_id, start=datetime.fromisoformat(start) if start else None,
+                end=datetime.fromisoformat(end) if end else None, duration=duration, ttft=ttft,
+                model=model, mode=SpeedMode(mode), completed=bool(completed), aborted=bool(aborted))
+        for row in self.connection.execute(
+                "SELECT thread_id, turn_id, at, model, event_key, mode, aggregate, input, output, cached, "
+                "reasoning, cache_write, write_hour FROM cache_usage WHERE cache_key=? ORDER BY rowid", (key,)):
+            thread_id, turn_id, at, model, event_key, mode, aggregate, *counts = row
+            threads[thread_id].turns[turn_id].modern.append(UsageEvent(
+                datetime.fromisoformat(at), Usage(*(int(v) for v in counts)), model, event_key,
+                SpeedMode(mode), bool(aggregate)))
+        for thread_id, call_id, at, turn_id, model, mode in self.connection.execute(
+                "SELECT thread_id, call_id, at, turn_id, model, mode FROM cache_calls WHERE cache_key=? ORDER BY rowid", (key,)):
+            threads[thread_id].calls[call_id] = ToolCall(datetime.fromisoformat(at), turn_id, model, SpeedMode(mode))
+        for thread_id, at, unit, amount in self.connection.execute(
+                "SELECT thread_id, at, unit, amount FROM cache_billing WHERE cache_key=? ORDER BY rowid", (key,)):
+            threads[thread_id].billing.append(BillingEvent(datetime.fromisoformat(at), unit, Decimal(amount)))
+        return list(threads.values())
+
+    def store(self, key: str, manifest: str, threads: list[Thread], quality: Quality) -> None:
+        # Replacing an affected group atomically also handles rewrites, copies and truncation.
+        self.connection.execute("DELETE FROM cache_groups WHERE cache_key=?", (key,))
+        self.connection.execute("INSERT INTO cache_groups VALUES (?, ?, ?, ?)",
+                                (key, manifest, json.dumps(quality.counts), json.dumps(quality.warnings)))
+        for thread in threads:
+            self.connection.execute("INSERT INTO cache_threads VALUES (?, ?, ?)",
+                                    (key, thread.id, thread.harness.value))
+            self.connection.executemany("INSERT INTO cache_turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                (key, thread.id, turn.id, turn.start.isoformat() if turn.start else None,
+                 turn.end.isoformat() if turn.end else None, turn.duration, turn.ttft, turn.model,
+                 turn.mode.value, turn.completed, turn.aborted) for turn in thread.turns.values()])
+            self.connection.executemany("INSERT INTO cache_usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                (key, thread.id, turn.id, i, record.at.isoformat(), record.model, record.key,
+                 record.mode.value, record.aggregate, str(record.usage.input), str(record.usage.output),
+                 str(record.usage.cached), str(record.usage.reasoning), str(record.usage.write),
+                 str(record.usage.write_hour))
+                for turn in thread.turns.values() for i, record in enumerate(turn.usage)])
+            self.connection.executemany("INSERT INTO cache_calls VALUES (?, ?, ?, ?, ?, ?, ?)", [
+                (key, thread.id, call_id, call.at.isoformat(), call.turn_id, call.model, call.mode.value)
+                for call_id, call in thread.calls.items()])
+            self.connection.executemany("INSERT INTO cache_billing VALUES (?, ?, ?, ?, ?, ?)", [
+                (key, thread.id, i, event.at.isoformat(), event.unit, str(event.amount))
+                for i, event in enumerate(thread.billing)])
+
+
+def source_manifest(paths: list[Path], harness: Harness) -> str:
+    stamps: list[tuple[str, str]] = []
+    for path in paths:
+        stamps.append((str(path), file_stamp(path)))
+        if harness == Harness.OPENCODE:
+            # Uncheckpointed SQLite writes live in the WAL, not the main database.
+            wal = Path(str(path) + "-wal")
+            stamps.append((str(wal), file_stamp(wal) if wal.exists() else "missing"))
+    return json.dumps(stamps)
+
+
+@dataclass
+class PreparedGroup:
+    key: str
+    manifest: str
+    uncached: list[Thread] | None = None
+    quality: Quality | None = None
+
+
+@dataclass
+class PreparedSources:
+    threads: Iterator[Thread]
+    files: set[Path]
+    first_at: datetime | None
+
+
+@contextmanager
+def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progress: bool,
+                    cache_path: Path | None, now: datetime) -> Iterator[PreparedSources]:
+    if cache_path:
+        for directory in sources.get(Harness.OPENCODE, []):
+            database = directory / "opencode.db" if directory.is_dir() else directory
+            if (database.resolve() == cache_path.resolve() or
+                    database.exists() and cache_path.exists() and database.samefile(cache_path)):
+                raise ValueError("the metrics cache must be separate from harness storage")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+    # A temporary SQLite working database also bounds memory when persistent caching is disabled.
+    temporary = tempfile.TemporaryDirectory(prefix="harness-report-") if cache_path is None else nullcontext(None)
+    with temporary as directory:
+        working_path = cache_path if cache_path is not None else Path(directory) / "metrics.sqlite3"
+        with closing(sqlite3.connect(working_path)) as connection:
+            cache = MetricsCache(connection)
+            with connection:
+                connection.execute("BEGIN")
+                connection.execute("CREATE TEMP TABLE report_groups (cache_key TEXT PRIMARY KEY)")
+                prepared: list[PreparedGroup] = []
+                all_paths: set[Path] = set()
+                readers = {Harness.CODEX: read_thread, Harness.CLAUDE: read_claude, Harness.COPILOT: read_copilot}
+                for harness, directories in sources.items():
+                    if harness in readers:
+                        paths = sorted({p.resolve() for directory in directories for p in directory.rglob("*.jsonl")})
+                        groups: dict[str, list[Path]] = defaultdict(list)
+                        for path in paths:
+                            try:
+                                identity = cache.identity(path, harness)
+                            except OSError:
+                                identity = str(path)
+                            groups[identity].append(path)
+                    else:
+                        paths = sorted({(directory / "opencode.db" if directory.is_dir() else directory).resolve()
+                                        for directory in directories})
+                        groups = {json.dumps([str(p) for p in paths]): paths} if paths else {}
+                    hits = 0
+                    parsed = 0
+                    for index, (thread_id, files) in enumerate(groups.items(), 1):
+                        key = json.dumps([harness.value, thread_id])
+                        try:
+                            manifest = source_manifest(files, harness)
+                        except OSError:
+                            manifest = ""
+                        count = cache.valid_count(key, manifest) if manifest else None
+                        group = PreparedGroup(key, manifest)
+                        if count is not None:
+                            hits += count
+                        else:
+                            group_quality = Quality()
+                            try:
+                                loaded = ([readers[harness](thread_id, files, group_quality)] if harness in readers
+                                          else read_opencode(files, group_quality))
+                            except (OSError, UnicodeError) as error:
+                                group_quality.warn("Unreadable files", files[0], 0, str(error))
+                                loaded = []
+                            parsed += len(loaded)
+                            stable = False
+                            if manifest and not group_quality.counts["Unreadable files"]:
+                                try:
+                                    stable = manifest == source_manifest(files, harness)
+                                except OSError:
+                                    pass
+                            if stable:
+                                cache.store(key, manifest, loaded, group_quality)
+                            else:
+                                group.uncached, group.quality = loaded, group_quality
+                        prepared.append(group)
+                        if group.uncached is None:
+                            connection.execute("INSERT INTO report_groups VALUES (?)", (key,))
+                        if progress and (index % 250 == 0 or index == len(groups)):
+                            print(f"{harness.value}: {hits:,} cached, {parsed:,} parsed; {index:,}/{len(groups):,} sources", file=sys.stderr)
+                    all_paths.update(paths)
+                first = cache.first_datapoint(now)
+                for group in prepared:
+                    for thread in group.uncached or []:
+                        at = first_datapoint(thread, now)
+                        if at is not None and (first is None or at < first):
+                            first = at
+
+                def threads() -> Iterator[Thread]:
+                    for group in prepared:
+                        if group.uncached is not None:
+                            if group.quality:
+                                quality.counts.update(group.quality.counts)
+                                quality.warnings.extend(group.quality.warnings[:max(0, 20 - len(quality.warnings))])
+                            yield from group.uncached
+                        else:
+                            loaded = cache.load(group.key, group.manifest, quality)
+                            if loaded is None:
+                                raise ValueError("metrics cache changed while generating the report; rerun the command")
+                            yield from loaded
+
+                yield PreparedSources(threads(), all_paths, first)
+
+
 def collect_report(root: Path, now: datetime | None = None, progress: bool = False,
                    additional_roots: Iterable[Path] = (),
                    harness_roots: dict[Harness, list[Path]] | None = None,
                    include_codex: bool = True, catalog: dict[str, Price] | None = None,
                    catalog_metadata: dict[str, Any] | None = None,
-                   report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
+                   report_zone: tzinfo = TIMEZONE,
+                   cache_path: Path | None = None) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("report cutoff must include a timezone")
@@ -1317,48 +1706,38 @@ def collect_report(root: Path, now: datetime | None = None, progress: bool = Fal
     if include_codex:
         sources[Harness.CODEX] = list(dict.fromkeys(p.resolve() for p in (root, *additional_roots)))
     roots = list(dict.fromkeys(p for paths in sources.values() for p in paths))
-    threads: list[Thread] = []
-    all_paths: set[Path] = set()
-    readers = {Harness.CODEX: read_thread, Harness.CLAUDE: read_claude, Harness.COPILOT: read_copilot}
-    for harness, directories in sources.items():
-        if harness in readers:
-            paths = sorted({p.resolve() for directory in directories for p in directory.rglob("*.jsonl")})
-            groups: dict[str, list[Path]] = defaultdict(list)
-            for path in paths:
-                groups[session_identity(path, harness)].append(path)
-            for index, (thread_id, files) in enumerate(groups.items(), 1):
-                try:
-                    threads.append(readers[harness](thread_id, files, quality))
-                except (OSError, UnicodeError) as error:
-                    quality.warn("Unreadable files", files[0], 0, str(error))
-                if progress and (index % 250 == 0 or index == len(groups)):
-                    print(f"{harness.value}: read {index:,}/{len(groups):,} conversations", file=sys.stderr)
-        else:
-            filename = "opencode.db"
-            paths = sorted({(directory / filename if directory.is_dir() else directory).resolve() for directory in directories})
-            threads.extend(read_opencode(paths, quality))
-        all_paths.update(paths)
-    for thread in threads:
-        thread.id = f"{thread.harness.value}:{thread.id}"
-    windows = make_windows(now, report_zone)
-    overall = empty_breakdown(windows)
-    by_harness: dict[str, Any] = {}
-    for harness in sources:
-        harness_threads = [t for t in threads if t.harness == harness]
-        if progress and harness_threads:
-            print(f"Calculating {harness.value} summary…", file=sys.stderr)
-        breakdown = empty_breakdown(windows)
-        for thread in harness_threads:
+    with prepare_sources(sources, quality, progress, cache_path, now) as prepared:
+        windows = make_windows(now, report_zone) + make_trend_windows(now, report_zone, prepared.first_at)
+        lookup = WindowLookup(windows)
+        overall = empty_breakdown(windows)
+        harness_breakdowns = {harness: empty_breakdown(windows) for harness in sources}
+        all_paths = prepared.files
+        thread_count = 0
+        models: dict[str, str | None] = {}
+        # Aggregate as conversations arrive; large archives need not all reside in memory.
+        if progress and all_paths:
+            print("Calculating metrics over available history…", file=sys.stderr)
+        for thread in prepared.threads:
+            thread_count += 1
+            thread.id = f"{thread.harness.value}:{thread.id}"
+            breakdown = harness_breakdowns[thread.harness]
             add_thread(breakdown.windows, thread, breakdown.by_model, breakdown.by_mode,
-                       breakdown.by_tier, catalog)
+                       breakdown.by_tier, catalog, lookup)
+            for turn in thread.turns.values():
+                for record in turn.usage:
+                    model = record.model or turn.model
+                    name = report_model(model, record.mode, is_long_context(model, record.usage, catalog, record.aggregate))
+                    models[name] = model
+    by_harness: dict[str, Any] = {}
+    for harness, breakdown in harness_breakdowns.items():
         merge_breakdown(overall, breakdown)
         by_harness[harness.value] = summarize_breakdown(breakdown, report_zone)
-    if progress and threads:
+    if progress and thread_count:
         print("Combining overall summary…", file=sys.stderr)
     report = summarize_breakdown(overall, report_zone)
     report.update({"generated": now.astimezone(report_zone).isoformat(), "timezone": str(report_zone),
                    "source": str(root.resolve()), "sources": [str(p) for p in roots],
-                   "files": len(all_paths), "threads": len(threads),
+                   "files": len(all_paths), "threads": thread_count,
                    "pricing_date": PRICING_DATE, "pricing_source": PRICING_SOURCE,
                    "anthropic_pricing_date": ANTHROPIC_PRICING_DATE,
                    "anthropic_pricing_source": ANTHROPIC_PRICING_SOURCE,
@@ -1368,10 +1747,6 @@ def collect_report(root: Path, now: datetime | None = None, progress: bool = Fal
                    "by_harness": by_harness,
                    "quality": dict(quality.counts), "warnings": quality.warnings})
     # Include only relevant matched catalog rows in the offline artifact.
-    models = {report_model(record.model or turn.model, record.mode,
-                           is_long_context(record.model or turn.model, record.usage, catalog, record.aggregate)):
-              record.model or turn.model
-              for thread in threads for turn in thread.turns.values() for record in turn.usage}
     matches = {name: router_model(model, catalog or {}) for name, model in models.items()
                if name in report["by_model"]}
     report["openrouter_rates"] = {model: {"id": identifier, "input": str(catalog[identifier].short.input),
@@ -1399,6 +1774,9 @@ def main() -> int:
     parser.add_argument("--claude-dir", type=Path, help="Claude projects directory (default: ~/.claude/projects)")
     parser.add_argument("--copilot-dir", type=Path, help="Copilot session-state directory (default: ~/.copilot/session-state)")
     parser.add_argument("--opencode-dir", type=Path, help="OpenCode data directory or opencode.db path")
+    cache_options = parser.add_mutually_exclusive_group()
+    cache_options.add_argument("--cache", type=Path, help="SQLite metrics cache path (default: user cache directory)")
+    cache_options.add_argument("--no-cache", action="store_true", help="read logs directly without a persistent cache")
     pricing_options = parser.add_mutually_exclusive_group()
     pricing_options.add_argument("--openrouter-prices", type=Path,
                                  help="saved /api/v1/models JSON catalog (default: bundled openrouter_prices.json)")
@@ -1460,10 +1838,13 @@ def main() -> int:
         report = collect_report(root, progress=True,
                                 additional_roots=[path for path in codex_roots if path.is_dir()] if args.directory is None else [],
                                 harness_roots=harness_roots, include_codex=Harness.CODEX in selected,
-                                catalog=catalog, catalog_metadata=catalog_metadata, report_zone=args.timezone)
+                                catalog=catalog, catalog_metadata=catalog_metadata, report_zone=args.timezone,
+                                cache_path=None if args.no_cache else args.cache or
+                                Path(os.environ.get("XDG_CACHE_HOME", str(home / ".cache"))) /
+                                "harness-report" / "metrics.sqlite3")
         args.output.write_text(render_report(report), encoding="utf-8")
-    except OSError as error:
-        print(f"Unable to write report: {error}", file=sys.stderr)
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"Unable to generate report: {error}", file=sys.stderr)
         return 1
     print(f"Report: {args.output.resolve()}")
     print(f"{report['files']:,} files; {report['threads']:,} conversations; pricing snapshot {PRICING_DATE}")
@@ -1478,8 +1859,10 @@ HTML = r'''<!doctype html>
 <style>
 :root{color-scheme:light;--ink:#172a3c;--muted:#62768a;--paper:#f3f6fa;--line:#e1e8f0;--blue:#3975e7;--teal:#159e99;--violet:#8c67db;--orange:#e99b36;--pink:#df7896}
 *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.6 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1280px;margin:auto;padding:44px 32px 56px}h1,h2,h3,p{margin:0}h1{font-size:38px;line-height:1.2;letter-spacing:-1.4px;font-weight:700}h2{font-size:20px;letter-spacing:-.4px}h3{font-size:16px;font-weight:650}.eyebrow{font-size:11px;letter-spacing:2px;font-weight:700;text-transform:uppercase;color:var(--teal);margin-bottom:12px}.header{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-bottom:32px}.subtitle{color:var(--muted);margin-top:10px}.badge{display:inline-flex;align-items:center;gap:7px;border:1px solid #cfdfdb;border-radius:30px;padding:7px 12px;color:#347c6e;background:#eff9f5;font-size:12px;white-space:nowrap}.dot{width:6px;height:6px;border-radius:50%;background:#159e99}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px;flex-wrap:wrap}.tabs{display:flex;gap:4px;padding:5px;background:#e6ecf3;border-radius:12px;flex-wrap:wrap}button{font:inherit;cursor:pointer}.tabs button{border:0;background:none;padding:9px 14px;border-radius:8px;color:var(--muted);font-weight:600;font-size:12px}.tabs button[aria-pressed=true]{background:#fff;color:var(--ink);box-shadow:0 2px 5px #182c3c10}button:focus-visible,a:focus-visible,[tabindex]:focus-visible{outline:3px solid #3975e780;outline-offset:3px}.range{color:var(--muted);font-size:12px}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:28px}.card,.panel{background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:0 3px 14px #24406003}.card{padding:21px 23px;position:relative;overflow:hidden}.card:before{content:"";position:absolute;top:0;left:23px;width:28px;height:3px;background:var(--accent);border-radius:0 0 3px 3px}.card-label{font-size:12px;color:var(--muted);font-weight:600}.card-value{font-size:31px;letter-spacing:-1px;line-height:1.3;margin:9px 0 7px;font-variant-numeric:tabular-nums}.card-note{font-size:11px;color:var(--muted)}.section-head{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:16px}.section-head p{color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;margin-bottom:28px}.panel{padding:23px}.panel-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}.panel p{color:var(--muted);font-size:12px;margin-top:4px}.unit{font-size:10px;background:var(--paper);padding:4px 8px;border-radius:6px;white-space:nowrap;color:var(--muted)}.legend{display:flex;gap:17px;margin-top:15px;flex-wrap:wrap;font-size:11px;color:var(--muted)}.legend span{display:inline-flex;align-items:center;gap:6px}.swatch{width:7px;height:7px;border-radius:2px;display:inline-block}.chart{margin-top:12px}.chart svg{width:100%;height:auto;display:block;overflow:visible}.stats{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px;border-top:1px solid var(--line);padding-top:15px;margin-top:5px}.stat{grid-column:span 3}.stat:nth-child(n+5){grid-column:span 4}.stat span{display:block;color:var(--muted);font-size:10px}.stat strong{font-size:20px;letter-spacing:-.3px;font-weight:600;font-variant-numeric:tabular-nums}.samples{font-size:11px;color:var(--muted);margin-top:10px}.breakdown-body{display:grid;grid-template-columns:190px 1fr;gap:18px;align-items:center;min-height:215px}.breakdown-body svg{width:100%;height:auto}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;color:var(--muted);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}th,td{padding:10px 5px;border-bottom:1px solid var(--line)}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}tfoot td{font-weight:700;border:0}td.label{white-space:nowrap}.notice{padding:12px 15px;background:#fff7e9;border:1px solid #f1dcae;border-radius:10px;color:#8a651f;font-size:12px;margin-bottom:20px}.empty{padding:44px 20px;text-align:center;color:var(--muted);background:var(--paper);border-radius:10px;margin:16px 0}.quality-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:18px}.definition{margin-bottom:12px;font-size:12px;color:var(--muted)}.definition b{color:var(--ink)}details{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}summary{cursor:pointer;font-weight:600;font-size:12px}.sources{font-size:11px;color:var(--muted);margin-top:16px;overflow-wrap:anywhere}.sources a{color:var(--blue)}.footer{display:flex;justify-content:space-between;gap:16px;margin-top:24px;color:var(--muted);font-size:11px}.tooltip{position:fixed;background:#172a3c;color:#fff;padding:8px 12px;border-radius:8px;font-size:12px;pointer-events:none;z-index:10;max-width:280px;box-shadow:0 5px 20px #172a3c30}.warnings{font:11px/1.7 ui-monospace,monospace;overflow-wrap:anywhere;padding-left:20px}noscript{display:block;padding:20px;background:#fff7e9}
+#performance{grid-template-columns:minmax(0,1fr)}
+.trend-stat-controls{border:0;padding:0;margin:0 0 18px}.trend-stat-controls legend{color:var(--muted);font-size:12px;padding:0;margin-bottom:8px}.trend-stat-options{display:flex;gap:18px;flex-wrap:wrap}.trend-stat-options label{display:inline-flex;align-items:center;gap:7px;font-size:12px;cursor:pointer}.trend-stat-options input{accent-color:var(--teal);width:15px;height:15px;margin:0}.trend-stat-options input:focus-visible{outline:3px solid #3975e780;outline-offset:3px}
 .token-totals{margin:14px 0 0;padding-top:10px;border-top:1px solid var(--line);font-size:11px}.token-totals div{display:flex;justify-content:space-between;gap:12px;margin-top:4px}.token-totals dt{color:var(--muted)}.token-totals dd{margin:0;font-weight:600;font-variant-numeric:tabular-nums}
-.filters{display:flex;gap:16px;flex-wrap:wrap}.model-filter{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px}.model-filter select{font:inherit;font-weight:600;color:var(--ink);background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 34px 10px 12px;max-width:100%}.model-filter select:focus-visible{outline:3px solid #3975e780;outline-offset:3px}.model-comparison{margin-bottom:28px}.comparison-controls{align-items:center;flex-wrap:wrap}.model-comparison table{min-width:800px;margin:16px 0 10px}.model-comparison th,.model-comparison td{white-space:nowrap;padding:13px 10px}.model-comparison td:first-child{font-weight:600}.model-comparison th:first-child,.model-comparison td:first-child{position:sticky;left:0;background:#fff}.model-comparison tr[data-selected=true],.model-comparison tr[data-selected=true] td:first-child{background:#f1f5fd}.filter-scope{color:var(--muted);font-size:12px;margin:-6px 0 18px}
+.filters{display:flex;gap:16px;flex-wrap:wrap}.model-filter{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px}.model-filter select,.model-filter input{font:inherit;font-weight:600;color:var(--ink);background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px;max-width:100%}.model-filter select{padding-right:34px}.model-filter select:focus-visible,.model-filter input:focus-visible{outline:3px solid #3975e780;outline-offset:3px}.range-error{color:#a33232;margin:-8px 0 16px}.model-comparison{margin-bottom:28px}.comparison-controls{align-items:center;flex-wrap:wrap}.model-comparison table{min-width:800px;margin:16px 0 10px}.model-comparison th,.model-comparison td{white-space:nowrap;padding:13px 10px}.model-comparison td:first-child{font-weight:600}.model-comparison th:first-child,.model-comparison td:first-child{position:sticky;left:0;background:#fff}.model-comparison tr[data-selected=true],.model-comparison tr[data-selected=true] td:first-child{background:#f1f5fd}.filter-scope{color:var(--muted);font-size:12px;margin:-6px 0 18px}
 @media(max-width:900px){main{padding:28px 20px}.cards{grid-template-columns:repeat(2,1fr)}.breakdown-body{grid-template-columns:140px 1fr;gap:10px}.card-value{font-size:28px}}
 @media(max-width:650px){h1{font-size:30px}.header{align-items:flex-start;gap:12px}.badge{font-size:10px;padding:5px 8px}.grid,.quality-grid{grid-template-columns:1fr}.cards{gap:10px}.card{padding:18px 16px}.card-value{font-size:25px}.section-head{display:block}.section-head p{margin-top:4px}.panel{padding:18px}.tabs button{padding:8px 10px;font-size:11px}.breakdown-body{grid-template-columns:130px 1fr}.footer{flex-direction:column;gap:3px}}
 @media print{body{background:#fff}main{padding:0}.tabs,.tooltip{display:none}.panel,.card{break-inside:avoid;box-shadow:none}.grid{gap:10px}.panel{padding:14px}details{display:block}}
@@ -1492,7 +1875,9 @@ HTML = r'''<!doctype html>
 <p class="filter-scope"><span id="model-scope">All models</span> · <span class="range" id="range"></span></p>
 <div class="notice" id="notice" hidden></div>
 <section class="cards" id="cards" aria-label="Selected window summary" aria-live="polite"></section>
-<div class="section-head"><h2>Performance across windows</h2><p>Average, median &amp; tail percentiles · overlapping periods are compared independently</p></div>
+<div class="section-head comparison-controls"><div><h2>Performance over time</h2><p id="trend-caption"></p></div><div class="filters"><label class="model-filter" for="trend-start">Start <input id="trend-start" type="date" required aria-describedby="trend-range-error"></label><label class="model-filter" for="trend-end">End <input id="trend-end" type="date" required aria-describedby="trend-range-error"></label><label class="model-filter" for="granularity-select">Data points <select id="granularity-select"><option value="hourly">Hourly</option><option value="daily" selected>Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label></div></div>
+<p id="trend-range-error" class="range-error" role="status" hidden></p>
+<fieldset class="trend-stat-controls"><legend>Displayed statistics</legend><div class="trend-stat-options" id="trend-stat-options"></div></fieldset>
 <section class="grid" id="performance" aria-label="Performance charts"></section>
 <div class="section-head"><h2>Tokens &amp; estimated cost</h2><p>Selected window · USD · API-equivalent token estimates</p></div>
 <section class="grid" id="breakdowns" aria-label="Token and cost breakdowns"></section>
@@ -1507,6 +1892,7 @@ HTML = r'''<!doctype html>
 <p class="definition"><b>Tool calls.</b> Model-issued function, custom-tool, web-search, and tool-search calls. Outputs and mirrored completion events are excluded; nested commands inside a call are not counted separately.</p>
 <p class="definition"><b>Token totals.</b> Total tokens equals input plus output. Input includes cached input and cache writes; output includes reasoning. Cached input counts cache reads and is a subset of input, not an additional token total. The composition chart separates these categories so each token is counted once.</p>
 <p class="definition"><b>Distribution statistics.</b> Average is the arithmetic mean. Median is the middle sample, or the average of the two middle samples for an even count. Minimum and maximum are observed extremes. P75, P95, and P99 use nearest rank. All statistics use the same valid samples; each completed turn receives equal weight for timing and throughput.</p>
+<p class="definition"><b>Trend points.</b> Start and End default to the first recorded activity date and the report cutoff date. Hourly, daily, weekly (Monday start), and monthly points use periods in the report timezone across all available history. Hourly points distinguish repeated daylight saving hours by their UTC offset, and the axis shows time within each selected date. The date controls show periods overlapping the chosen range; weekly and monthly statistics include the whole calendar period. The first and current periods can be partial. Statistics are calculated from each period's samples; conversation duration and calls include activity within that period. Missing samples appear as gaps. Figures below charts describe the selected reporting window.</p>
 <p class="definition"><b>Window boundaries.</b> Tokens and calls use record time; turn metrics use completion time. Today starts at midnight in the report timezone and ends at the report cutoff. Yesterday is the preceding calendar day in that timezone, excluding today's midnight. Rolling windows are exact 24-hour days. The full duration of a turn finishing in the window is assigned to that window.</p>
 <p class="definition"><b>Model attribution.</b> Fast usage has a separate model entry with a “-fast” suffix. Requests crossing a published context-pricing threshold have a “-long” suffix, including cached input when selecting the threshold; combined usage has “-fast-long”. Usage below the threshold keeps the model name unless Fast. Models without context pricing and aggregate records without per-request sizes do not receive “-long”. Tokens, calls, timing, and costs are separated by recorded mode, with the Fast premium applied to the underlying model's rates. Tokens and calls use their recorded model, falling back to the turn model. Timing uses the model generating that turn. Conversation duration and tool counts include only that model's activity; a thread using multiple models or modes appears in each, so conversation counts are not additive. If several models generate output within one turn, its timing is listed under “Mixed models (timing)”. If one model uses several modes within a turn, its timing is listed under “Mixed modes (timing)” because separate durations cannot be recovered. If one model in one mode crosses context thresholds within a turn, its timing is listed under “Mixed contexts (timing)”. Tool calls follow the context class of matching model and mode usage in their turn; ambiguous calls are listed under “Mixed contexts (tools)”. Mode and tier totals retain this activity once.</p>
 <p class="definition"><b>Model tiers.</b> Budget: Luna, Terra, GPT-5.4-mini, Spark, codex-auto-review, and Claude Haiku. Medium: Sol, GPT-5.4, GPT-5.5, and Claude Sonnet. High: Astra, Claude Opus, Fable, and Mythos. Models outside these groups are Unclassified. Tier metrics are calculated from underlying activity, with each conversation counted once per tier. Turns using several models in the same tier retain their timing in that tier; turns spanning tiers have timing under “Mixed tiers (timing)”. Per-model pricing and the Fast premium still apply. The model selector and comparison table show entries with recorded tokens in the selected window, harness, tier, and mode. Zero-token entries, including shared timing and tool-call buckets, remain included in aggregate totals and coverage.</p>
@@ -1529,12 +1915,17 @@ const data=JSON.parse(document.getElementById('report-data').textContent);
 const colors=['#3975e7','#159e99','#8c67db','#e99b36','#df7896'];
 const metricDefs=[['ttft','Time to first token','seconds','Explicit first-token timing per completed turn'],['throughput','Effective throughput','tokens / second','Output tokens over full turn duration'],['length','Conversation length','minutes','Active duration per conversation'],['tools','Tool calls','calls / conversation','Model-issued calls per conversation']];
 const chartStats=[['avg','Average',colors[0]],['median','Median',colors[3]],['p75','P75',colors[4]],['p95','P95',colors[1]],['p99','P99',colors[2]]];
+const selectedChartStats=new Set(['p95']);
+const visibleChartStats=()=>chartStats.filter(([stat])=>selectedChartStats.has(stat));
 const statDefs=[['avg','Average'],['p75','P75'],['p95','P95'],['p99','P99'],['min','Minimum'],['median','Median'],['max','Maximum']];
-let selected=0,selectedModel='',selectedMode='',selectedTier='',selectedHarness='',selectedStatistic='avg';
+let selected=0,selectedModel='',selectedMode='',selectedTier='',selectedHarness='',selectedStatistic='avg',selectedGranularity='daily';
+const firstDate=data.trend_periods.daily[0].start.slice(0,10),cutoffDate=data.generated.slice(0,10);
+let trendStart=firstDate,trendEnd=cutoffDate;
 const harnessGroup=()=>selectedHarness?data.by_harness[selectedHarness]:data;
 const activeGroup=()=>selectedTier?harnessGroup().by_tier[selectedTier]:harnessGroup();
 const activeModels=()=>selectedMode?activeGroup().by_mode[selectedMode].by_model:activeGroup().by_model;
 const visibleModels=()=>Object.entries(activeModels()).filter(([,windows])=>windows[selected].total_tokens>0);
+const activeTrends=()=>{const group=selectedMode?activeGroup().by_mode[selectedMode]:activeGroup();return (selectedModel?group.by_model_trends[selectedModel]:group.trends)[selectedGranularity]};
 const activeWindows=()=>selectedModel?activeModels()[selectedModel]:selectedMode?activeGroup().by_mode[selectedMode].windows:activeGroup().windows;
 const $=id=>document.getElementById(id), number=n=>Number(n).toLocaleString('en-US',{maximumFractionDigits:2}), money=n=>Number(n).toLocaleString('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2});
 const compact=n=>Number(n).toLocaleString('en-US',{notation:'compact',maximumFractionDigits:1});
@@ -1548,13 +1939,74 @@ const svgNode=(tag,attrs={},value)=>{const e=document.createElementNS('http://ww
 function svgBase(label,w,h){const svg=svgNode('svg',{viewBox:`0 0 ${w} ${h}`,role:'img','aria-label':label});svg.append(svgNode('title',{},label));return svg}
 function tip(node,label){node.setAttribute('tabindex','0');node.setAttribute('aria-label',label);node.append(svgNode('title',{},label));const show=(event)=>{const rect=node.getBoundingClientRect();const x=event.clientX||rect.x+rect.width/2,y=event.clientY||rect.y;$('tooltip').textContent=label;$('tooltip').hidden=false;$('tooltip').style.left=`${Math.max(8,Math.min(x+12,window.innerWidth-285))}px`;$('tooltip').style.top=`${Math.max(8,Math.min(y+14,window.innerHeight-80))}px`};node.addEventListener('pointermove',show);node.addEventListener('focus',show);for(const kind of ['pointerleave','blur'])node.addEventListener(kind,()=>$('tooltip').hidden=true)}
 function table(target,headers,rows){target.replaceChildren();const head=document.createElement('thead'),tr=document.createElement('tr');headers.forEach((h,i)=>tr.append(text('th',h,i?'num':'')));head.append(tr);target.append(head);const body=document.createElement('tbody');rows.forEach(row=>{const r=document.createElement('tr');row.forEach((v,i)=>r.append(text('td',v,i?'num':'')));body.append(r)});target.append(body)}
-function metricChart(key,title,unit){const windows=activeWindows();const values=windows.map(w=>w.metrics[key]);const maxima=values.flatMap(v=>chartStats.map(([stat])=>v[stat])).filter(v=>v!==null).map(v=>key==='length'?v/60:v);if(!maxima.length)return text('div','No valid samples in these windows.','empty');const svg=svgBase(`${title}: average, median, P75, P95 and P99 for ${windows.length} windows`,540,230),max=Math.max(...maxima,0.001)*1.12,top=18,bottom=190,left=48,right=530;for(let i=0;i<=4;i++){const y=bottom-(bottom-top)*i/4;svg.append(svgNode('line',{x1:left,y1:y,x2:right,y2:y,stroke:'#e9eef4','stroke-dasharray':i?'3 4':'0'}));svg.append(svgNode('text',{x:left-7,y:y+3,'text-anchor':'end',fill:'#8290a1','font-size':10},compact(max*i/4)))}const group=(right-left)/windows.length,barWidth=Math.min(10,group*.14),stride=barWidth+Math.min(3,group*.025);values.forEach((v,index)=>{const center=left+group*(index+.5);if(index===selected)svg.append(svgNode('rect',{x:center-group*.45,y:top-5,width:group*.9,height:bottom-top+10,rx:6,fill:'#f1f5fd'}));chartStats.forEach(([stat,label,color],s)=>{if(v[stat]===null)return;const value=key==='length'?v[stat]/60:v[stat],height=Math.max(1,value/max*(bottom-top)),bar=svgNode('rect',{x:center-stride*chartStats.length/2+s*stride,y:bottom-height,width:barWidth,height,rx:3,fill:color,opacity:index===selected?1:.65});tip(bar,`${windows[index].label} · ${label}: ${number(value)} ${unit} · ${number(v.count)} samples`);svg.append(bar)});svg.append(svgNode('text',{x:center,y:213,'text-anchor':'middle',fill:index===selected?'#172a3c':'#8290a1','font-size':10,'font-weight':index===selected?700:400},windows[index].label==='Yesterday'?'Yest.':windows[index].label.replace(/^Last (\d+) days$/,'$1d')))});return svg}
-function legend(){const el=text('div','','legend');chartStats.forEach(([,name,color])=>{const s=text('span',name),dot=text('i','','swatch');dot.style.background=color;s.prepend(dot);el.append(s)});return el}
-function performance(window){$('performance').replaceChildren();for(const [key,title,unit,desc] of metricDefs){const panel=text('article','','panel'),top=text('div','','panel-top'),heading=text('div','');heading.append(text('h3',title),text('p',desc));top.append(heading,text('span',unit,'unit'));panel.append(top,legend());const chart=text('div','','chart');chart.append(metricChart(key,title,unit));panel.append(chart);const stats=text('div','','stats');for(const [stat,label] of statDefs){const e=text('div','','stat');e.append(text('span',label.toUpperCase()),text('strong',displayMetric(key,window.metrics[key][stat])));stats.append(e)}panel.append(stats,text('div',`${number(window.metrics[key].count)} valid ${key==='length'||key==='tools'?'conversation':'turn'} samples · ${window.label}`,'samples'));$('performance').append(panel)}}
+function metricChart(key,title,unit){
+    const statistics=visibleChartStats();
+    if(!statistics.length)return text('div','Select a statistic above to display the chart.','empty');
+    const active=activeTrends();
+    const firstDay=data.trend_periods.daily.find(p=>p.start.slice(0,10)===trendStart),lastDay=data.trend_periods.daily.find(p=>p.start.slice(0,10)===trendEnd),rangeStart=Date.parse(firstDay.start);
+    const entries=data.trend_periods[selectedGranularity].map((period,index)=>({period,metrics:active[index]})).filter(({period})=>period.start.slice(0,10)<=trendEnd&&(Date.parse(period.end)>rangeStart||Date.parse(period.end)===rangeStart&&!period.end_exclusive));
+    const periods=entries.map(({period})=>period),values=entries.map(({metrics})=>metrics);
+    const maxima=values.flatMap(v=>v?statistics.map(([stat])=>v[key][stat]):[]).filter(v=>v!==null).map(v=>key==='length'?v/60:v);
+    if(!maxima.length)return text('div','No valid samples in these periods.','empty');
+    const svg=svgBase(`${title}: ${selectedGranularity} ${statistics.map(([,label])=>label).join(', ')} from ${trendStart} to ${trendEnd}`,540,230);
+    const max=maxima.reduce((largest,value)=>Math.max(largest,value),0.001)*1.12,top=18,bottom=190,left=48,right=530;
+    const hourly=selectedGranularity==='hourly',dateNumber=date=>Date.parse(date+'T00:00:00Z');
+    const start=hourly?rangeStart:dateNumber(trendStart);
+    const end=hourly?Date.parse(lastDay.end):dateNumber(trendEnd);
+    const x=date=>end===start?(left+right)/2:left+(right-left)*(date-start)/(end-start);
+    for(let i=0;i<=4;i++){
+        const y=bottom-(bottom-top)*i/4;
+        svg.append(svgNode('line',{x1:left,y1:y,x2:right,y2:y,stroke:'#e9eef4','stroke-dasharray':i?'3 4':'0'}));
+        svg.append(svgNode('text',{x:left-7,y:y+3,'text-anchor':'end',fill:'#8290a1','font-size':10},compact(max*i/4)));
+    }
+    for(const [stat,label,color] of statistics){
+        let path='',connected=false;
+        const points=[];
+        values.forEach((metrics,index)=>{
+            const m=metrics?.[key];
+            if(!m||m[stat]===null){connected=false;return}
+            const value=key==='length'?m[stat]/60:m[stat],at=hourly?Date.parse(periods[index].start):dateNumber(periods[index].start.slice(0,10)),cx=x(Math.max(start,at)),cy=bottom-value/max*(bottom-top);
+            path+=`${connected?'L':'M'}${cx},${cy} `;connected=true;
+            const point=svgNode('circle',{cx,cy,r:hourly||selectedGranularity==='daily'?2.5:3.5,fill:color,stroke:'#fff','stroke-width':1});
+            const period=periods[index];
+            tip(point,`${period.label} · ${fmtTime(period.start)} – ${fmtTime(period.end)}${period.end_exclusive?' (end excluded)':''} · ${label}: ${number(value)} ${unit} · ${number(m.count)} samples`);
+            points.push(point);
+        });
+        svg.append(svgNode('path',{d:path,fill:'none',stroke:color,'stroke-width':2,'stroke-linejoin':'round'}),...points);
+    }
+    const days=Math.round((dateNumber(trendEnd)-dateNumber(trendStart))/86400000),ticks=hourly?(end>start?Math.max(1,Math.min(5,Math.floor((end-start)/3600000))):0):Math.min(5,days);
+    for(let i=0;i<=ticks;i++){
+        const at=hourly?(i===ticks?end:start+Math.round((end-start)*i/ticks/3600000)*3600000):start+(ticks?Math.round(days*i/ticks):0)*86400000;
+        const label=hourly?new Date(at).toLocaleString('en-US',{hour:'numeric',minute:'2-digit',...(days?{month:'short',day:'numeric'}:{}),timeZone:data.timezone}):new Date(at).toLocaleDateString('en-US',{month:'short',day:'numeric',...(days>365?{year:'2-digit'}:{}),timeZone:'UTC'});
+        svg.append(svgNode('text',{x:x(at),y:213,'text-anchor':ticks===0?'middle':i===0?'start':i===ticks?'end':'middle',fill:'#8290a1','font-size':10},label));
+    }
+    return svg;
+}
+function legend(){const el=text('div','','legend');visibleChartStats().forEach(([,name,color])=>{const s=text('span',name),dot=text('i','','swatch');dot.style.background=color;s.prepend(dot);el.append(s)});return el}
+function performance(window){$('trend-caption').textContent=`${trendStart} – ${trendEnd} · calendar period statistics · ${visibleChartStats().map(([,label])=>label).join(', ')||'no statistics selected'}`;$('performance').replaceChildren();for(const [key,title,unit,desc] of metricDefs){const panel=text('article','','panel'),top=text('div','','panel-top'),heading=text('div','');heading.append(text('h3',title),text('p',desc));top.append(heading,text('span',unit,'unit'));panel.append(top,legend());const chart=text('div','','chart');chart.append(metricChart(key,title,unit));panel.append(chart);const stats=text('div','','stats');for(const [stat,label] of statDefs){const e=text('div','','stat');e.append(text('span',label.toUpperCase()),text('strong',displayMetric(key,window.metrics[key][stat])));stats.append(e)}panel.append(stats,text('div',`${number(window.metrics[key].count)} valid ${key==='length'||key==='tools'?'conversation':'turn'} samples · ${window.label}`,'samples'));$('performance').append(panel)}}
 function donut(categories,field,total,title){const svg=svgBase(title,190,190),cx=95,cy=95,r=68,length=2*Math.PI*r;svg.append(svgNode('circle',{cx,cy,r,fill:'none',stroke:'#edf1f6','stroke-width':20}));let offset=0;categories.forEach((cat,i)=>{const value=Number(cat[field]);if(value<=0||total<=0)return;const segment=value/total*length,circle=svgNode('circle',{cx,cy,r,fill:'none',stroke:colors[i],'stroke-width':20,'stroke-dasharray':`${segment} ${length-segment}`,'stroke-dashoffset':-offset,transform:'rotate(-90 95 95)'});tip(circle,`${cat.name}: ${field==='cost'?money(value):number(value)} (${number(value/total*100)}%)`);svg.append(circle);offset+=segment});svg.append(svgNode('text',{x:95,y:94,'text-anchor':'middle',fill:'#172a3c','font-size':22,'font-weight':650},field==='cost'?money(total):compact(total)),svgNode('text',{x:95,y:116,'text-anchor':'middle',fill:'#8290a1','font-size':10},field==='cost'?'ESTIMATED USD':'TOTAL TOKENS'));return svg}
 function breakdowns(window){$('breakdowns').replaceChildren();for(const field of ['tokens','cost']){const panel=text('article','','panel'),title=field==='tokens'?'Token composition':'Cost composition';panel.append(text('h3',title),text('p',field==='tokens'?'Separate categories · each token counted once':`Estimated API-equivalent token cost${window.partial_cost?' · partial':''}`));const body=text('div','','breakdown-body');body.append(donut(window.categories,field,field==='tokens'?window.total_tokens:Number(window.cost),title));const wrap=text('div','','table-wrap'),t=document.createElement('table');table(t,['Category',field==='tokens'?'Tokens':'USD'],[]);const tbody=t.querySelector('tbody');window.categories.forEach((cat,i)=>{const tr=document.createElement('tr'),label=text('td',cat.name,'label'),dot=text('i','','swatch');dot.style.background=colors[i];dot.style.marginRight='7px';label.prepend(dot);const value=field==='tokens'?number(cat.tokens):money(cat.cost);tr.append(label,text('td',value+(field==='cost'&&cat.unpriced_tokens?' *':''),'num'));tbody.append(tr)});const foot=document.createElement('tfoot'),row=document.createElement('tr');row.append(text('td','Total'),text('td',field==='tokens'?number(window.total_tokens):money(window.cost),'num'));foot.append(row);t.append(foot);wrap.append(t);body.append(wrap);panel.append(body);if(field==='cost'&&window.partial_cost)panel.append(text('p',`* ${number(window.unpriced_tokens)} tokens excluded from the API estimate; see unpriced usage and recorded billing below.`));$('breakdowns').append(panel)}}
 function selectWindow(index){selected=index;modelOptions();recordedBilling();$('tooltip').hidden=true;const w=activeWindows()[index];$('model-scope').textContent=`${selectedHarness||'All harnesses'} · ${selectedTier||'All tiers'} · ${selectedModel||'All models'} · ${selectedMode||'All modes'}`;[...$('tabs').children].forEach((b,i)=>b.setAttribute('aria-pressed',i===index));$('range').textContent=w.end_exclusive?`${fmtDate(w.start)} · full calendar day`:`${fmtDate(w.start)} – ${fmtTime(w.end)}`;$('notice').hidden=!w.partial_cost&&!Object.keys(data.quality).some(k=>k.startsWith('Malformed')||k==='Unreadable files'||k==='Invalid usage records');$('notice').textContent=w.partial_cost?`Partial cost estimate: ${number(w.unpriced_tokens)} tokens lack a verified rate or the category detail needed to calculate cost. Their usage is included in token totals.`:'Some records could not be read. Review parser diagnostics below.';$('cards').replaceChildren();const cards=[['Conversations',number(w.conversations),'Active threads, including subagents',colors[0]],['Total tokens',compact(w.total_tokens),`${number(w.total_tokens)} recorded tokens`,colors[1]],['Active duration',number(w.active_seconds/3600)+' h','Completed turn durations, summed',colors[2]],['Estimated cost',money(w.cost),w.partial_cost?'Partial estimate · USD':'USD · API-equivalent estimate',colors[3]]];for(const [label,value,note,color] of cards){const c=text('article','','card');c.style.setProperty('--accent',color);c.append(text('div',label,'card-label'),text('div',value,'card-value'),text('div',note,'card-note'));if(label==='Total tokens'){const totals=document.createElement('dl');totals.className='token-totals';for(const [name,count] of [['Input (includes cached)',w.input_tokens],['Output (includes reasoning)',w.output_tokens],['Cached input',w.cached_input_tokens]]){const row=document.createElement('div');row.append(text('dt',name),text('dd',number(count)));totals.append(row)}c.append(totals)}$('cards').append(c)}performance(w);breakdowns(w);tierComparison();modelComparison();exactMetrics();const coverage=[['Completed turns',w.coverage['Completed turns']||0],['First-token timing samples',w.metrics.ttft.count],['Missing first-token timing',w.coverage['Missing first-token timing']||0],['Missing turn duration',w.coverage['Missing turn duration']||0],['Throughput samples',w.metrics.throughput.count],['Missing throughput samples',w.coverage['Missing throughput samples']||0],['Conversation duration samples',w.metrics.length.count],['Aborted turns',w.coverage['Aborted turns']||0],['Unfinished turns started in window',w.coverage['Unfinished turns']||0],['Usage responses',w.coverage['Usage responses']||0],['Tool calls',w.tool_calls]];table($('coverage'),['Measurement','Count'],coverage.map(([k,v])=>[k,number(v)]));$('unpriced').replaceChildren();if(w.partial_cost){const t=document.createElement('table');table(t,['Model','Unpriced tokens'],Object.entries(w.unpriced).map(([k,v])=>[k,number(v)]));$('unpriced').append(t)}else $('unpriced').append(text('p','All recorded usage in this window has a published or assumed rate.'));table($('models'),['Model','Total tokens'],Object.entries(w.models).filter(([,tokens])=>tokens>0).map(([k,v])=>[k,number(v)]))}
 for(const [stat,label] of statDefs){const option=text('option',label);option.value=stat;$('comparison-stat-select').append(option);}
+for(const [stat,label,color] of chartStats){
+    const option=text('label',''),input=document.createElement('input'),swatch=text('i','','swatch');
+    input.type='checkbox';input.value=stat;input.checked=selectedChartStats.has(stat);swatch.style.background=color;
+    option.append(input,swatch,document.createTextNode(label));$('trend-stat-options').append(option);
+    input.addEventListener('change',()=>{
+        if(input.checked)selectedChartStats.add(stat);else selectedChartStats.delete(stat);
+        $('tooltip').hidden=true;performance(activeWindows()[selected]);
+    });
+}
+for(const id of ['trend-start','trend-end']){
+    const input=$(id);input.min=firstDate;input.max=cutoffDate;input.value=id==='trend-start'?trendStart:trendEnd;
+    input.addEventListener('change',()=>{
+        const start=$('trend-start'),end=$('trend-end'),error=$('trend-range-error');
+        error.hidden=start.validity.valid&&end.validity.valid&&start.value<=end.value;
+        if(!error.hidden){error.textContent=`Choose dates from ${firstDate} to ${cutoffDate}, with Start on or before End.`;return}
+        trendStart=start.value;trendEnd=end.value;$('tooltip').hidden=true;performance(activeWindows()[selected]);
+    });
+}
+$('granularity-select').addEventListener('change',()=>{selectedGranularity=$('granularity-select').value;$('tooltip').hidden=true;performance(activeWindows()[selected]);});
 $('comparison-stat-select').value=selectedStatistic;
 $('comparison-stat-select').addEventListener('change',()=>{selectedStatistic=$('comparison-stat-select').value;tierComparison();modelComparison();});
 $('subtitle').textContent=`${number(data.files)} log files · ${number(data.threads)} threads · ${data.timezone}`;

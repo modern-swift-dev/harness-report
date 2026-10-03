@@ -24,6 +24,12 @@ python3 harness_metrics.py --offline --output report.html
 
 Open `report.html` in your browser. The report is a snapshot: rerun the command to include new activity. An existing output file is overwritten.
 
+The CLI maintains a SQLite cache at `~/.cache/harness-report/metrics.sqlite3` (or under `XDG_CACHE_HOME` when set). The first run parses the selected sources. Later runs add new conversations and skip parsing unchanged files, including their session headers. Files are checked using their identity, size, and modification/change timestamps. Changed conversations are refreshed atomically, so appended turns, rewrites, and duplicate archive copies do not double-count activity. Active conversations are reparsed when they change; the cache does not assume they are finished.
+
+The cache contains normalized usage, timing, calls, billing, and parser diagnostics, without message text or tool arguments. Prices, timezones, and the report cutoff are applied when generating each report, so changing them does not require reimporting logs. Reports include only the currently selected source files; unrelated or removed sources retained in the cache are excluded. OpenCode cache invalidation includes its SQLite WAL file; a changed OpenCode database is refreshed as a whole.
+
+Use `--cache /path/to/metrics.sqlite3` to choose a separate cache database, or `--no-cache` to reparse sources without persistent caching. A temporary SQLite working database keeps memory bounded when persistent caching is disabled and is removed after generation. Keep the cache separate from harness databases. The cache is disposable: if its version is incompatible, use a new cache path or bypass it. Source logs remain read-only. Progress output shows how many conversations were cached or parsed.
+
 Without a directory argument, the script scans the current directory for Codex JSONL logs and discovers these installed sources when present:
 
 | Harness | Default source |
@@ -79,6 +85,8 @@ python3 harness_metrics.py --help
 | `--opencode-dir PATH` | OpenCode data directory or database file. |
 | `--output PATH` | HTML output; defaults to `harness_metrics.html`. The parent directory must exist. |
 | `--timezone NAME` | Timezone for calendar windows, such as `UTC` or `Europe/Paris`. |
+| `--cache PATH` | Persistent SQLite metrics cache; defaults to the user cache directory. |
+| `--no-cache` | Reparse sources without reading or writing the persistent metrics cache. |
 | `--offline` | Use local pricing only (the default); cannot be combined with `--live-prices`. |
 | `--openrouter-prices PATH` | Use a saved OpenRouter `/api/v1/models` JSON response instead of the bundled catalog. |
 | `--live-prices` | Fetch OpenRouter prices; use the bundled catalog if the request fails. |
@@ -110,6 +118,8 @@ Costs are **API-equivalent estimates, not subscription bills**. Embedded rates a
 ## Read the report
 
 Choose a reporting window and filter by harness, tier, model, or mode. Comparison tables offer average, median, minimum, maximum, P75, P95, and P99 statistics.
+
+The four performance charts are stacked at full width. **Displayed statistics** lets you choose any combination of Average, Median, P75, P95, and P99 lines, with only **P95** selected by default. Selections apply to all four charts, persist when changing dates, intervals, or filters, and set the vertical scale using only the visible lines. Their **Start** and **End** date controls default to the first recorded activity date and today (the report cutoff date). All available history is included, including activity older than a year. Choose Hourly, Daily, Weekly, or Monthly points; date choices persist when changing intervals or filters. Hourly points use the report timezone and show times within the selected dates; repeated daylight saving hours remain separate, with their UTC offset in the tooltip. Weekly and monthly points show statistics for entire calendar periods overlapping the selected range, with partial first and current periods. Missing samples appear as gaps. Statistics beneath each chart still describe the selected reporting window.
 
 The top token summary shows total input, output, and cached input for the selected filters. Input includes cached input and cache writes; output includes reasoning. Total tokens equals input plus output. Cached input counts cache reads and is already included in input.
 
