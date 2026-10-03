@@ -2,11 +2,11 @@
 
 Generate an interactive HTML usage report from local **Codex, Claude Code, Copilot CLI, and OpenCode** session data. Explore token counts, estimated API costs, tool calls, and timing statistics by harness, model, model tier, and speed mode.
 
-The script reads session storage without modifying it. Each report includes its data and visual assets and can be opened offline.
+The script reads session storage without modifying it. Each static report includes its data and visual assets and can be opened offline. An optional local dashboard loads summaries and chart series on demand from the SQLite metrics cache.
 
 ## Requirements
 
-- Python 3.10 or later; no third-party Python packages are required.
+- Python 3.10 or later; static reports require no third-party Python packages. The optional server dependencies are listed in `requirements-server.txt`.
 - Local session logs or an OpenCode database in a supported format.
 - A browser with JavaScript enabled to view the report.
 
@@ -40,6 +40,57 @@ Without a directory argument, the script scans the current directory for Codex J
 | OpenCode | `~/.local/share/opencode/opencode.db` |
 
 `CLAUDE_CONFIG_DIR` changes the Claude configuration root; its `projects` subdirectory is scanned. `XDG_DATA_HOME` changes OpenCode's data root; the script looks under `opencode`.
+
+## Local dashboard
+
+With Homebrew installed, set up Python and all server dependencies, then start the dashboard:
+
+```sh
+make setup
+make serve
+```
+
+`Brewfile` declares Python 3.14, including SQLite support. `make setup` installs missing Homebrew dependencies without upgrading existing formulae, creates `.venv`, and installs the Python libraries from `requirements-server.txt`. `make serve` starts the server using that environment.
+
+Without Homebrew, use any installed Python 3.10 or later to create the environment and install the server dependencies:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements-server.txt
+make serve
+```
+
+Open [http://localhost:3050](http://localhost:3050). The server binds to `127.0.0.1:3050` and needs no internet connection with the default pricing. Press Ctrl+C to stop it. An occupied port stops startup before any source import.
+
+The dashboard HTML is approximately 50 KB, with no embedded metrics. It preserves the static report's controls, charts, comparisons, and data-quality sections. The browser requests summaries for the current filters and one chart series for the chosen dates and interval. The server calculates reporting summaries once per refresh and keeps a bounded cache of requested chart series. Startup and refresh can take tens of seconds for large databases; later view requests reuse those summaries.
+
+Startup imports configured sources into the persistent cache without generating a static report. **Refresh sources** repeats the import and recalculates summaries; controls pause until it finishes. There is no automatic polling. Failed refreshes retain the previous snapshot. Sources that change while being read or cannot be imported cause a refresh error; check access and retry. Malformed individual records are skipped with diagnostics while valid usage is retained.
+
+The dashboard includes **every conversation retained in the chosen metrics database**, including cached sources that no longer exist. Source arguments and `--harness` select what to import during refresh; use the dashboard filters to control what is displayed. Changing source options does not remove older cached conversations. Choose a separate `--cache` path to isolate an archive.
+
+Source discovery, timezone, cache, and pricing options match the static generator:
+
+```sh
+python3 harness_server.py /path/to/codex-archive --cache /path/to/archive-metrics.sqlite3 --timezone UTC
+python3 harness_server.py --harness claude --claude-dir /path/to/claude-projects
+python3 harness_server.py --help
+```
+
+The server requires persistent caching and does not accept `--no-cache` or `--output`. Rates are selected at startup and stay fixed until restart. Changes made by another importer are detected; use Refresh to load a consistent snapshot. API reads access SQLite read-only; imports update only the metrics cache, never harness storage. The cache must remain separate from harness databases.
+
+The local REST API provides:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/metadata` | Current snapshot ID, cutoff, history, choices, pricing, and diagnostics. |
+| `GET /api/dashboard` | Reporting summaries, model/tier comparisons, billing, and catalog rates for selected filters. |
+| `GET /api/trends` | One filtered series for the requested dates and interval, retaining gaps. |
+| `POST /api/refresh` | Import configured sources and publish a new snapshot. |
+
+Dashboard queries require `snapshot` and accept `window` (`today`, `yesterday`, or `last_N_days` for the supported windows), `harness`, `tier`, `model`, and `mode`. Trend queries require `snapshot`, `start`, and `end` (ISO dates), and also accept the scope filters and `granularity` (`hourly`, `daily`, `weekly`, or `monthly`). Enum values for tier and mode match their dashboard labels. `/openapi.json` documents the typed request and response schemas. Invalid queries return 422; stale snapshots return 409. Both HTML and API responses disable browser caching.
+
+Static HTML generation is unchanged and does not require these dependencies.
 
 ## Choose your sources
 

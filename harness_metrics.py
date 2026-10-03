@@ -1007,11 +1007,12 @@ def make_windows(now: datetime, report_zone: tzinfo = TIMEZONE) -> list[Window]:
 
 
 def make_trend_windows(now: datetime, report_zone: tzinfo = TIMEZONE,
-                       start: datetime | None = None) -> list[Window]:
+                       start: datetime | None = None,
+                       granularities: Iterable[Granularity] = Granularity) -> list[Window]:
     midnight = (start or now).astimezone(report_zone).replace(hour=0, minute=0, second=0, microsecond=0)
     start = midnight.astimezone(timezone.utc)
     windows: list[Window] = []
-    for granularity in Granularity:
+    for granularity in granularities:
         cursor = midnight
         if granularity == Granularity.WEEKLY:
             cursor -= timedelta(days=cursor.weekday())
@@ -1055,6 +1056,18 @@ class WindowLookup:
                 if self.windows[index].contains(at):
                     result.append(index)
         return result
+
+
+@dataclass(frozen=True)
+class MetricScope:
+    model: str | None = None
+    mode: SpeedMode | None = None
+    tier: ModelTier | None = None
+
+    def matches(self, model: str, mode: SpeedMode, tier: ModelTier) -> bool:
+        return ((self.model is None or self.model == model)
+                and (self.mode is None or self.mode == mode)
+                and (self.tier is None or self.tier == tier))
 
 
 @dataclass
@@ -1157,14 +1170,17 @@ def add_thread(windows: list[Window], thread: Thread,
                by_mode: dict[SpeedMode, ModeBreakdown] | None = None,
                by_tier: dict[ModelTier, TierBreakdown] | None = None,
                catalog: dict[str, Price] | None = None,
-               lookup: WindowLookup | None = None) -> None:
+               lookup: WindowLookup | None = None,
+               scope: MetricScope | None = None) -> None:
     lookup = lookup or WindowLookup(windows)
 
     def targets(model: str | None, mode: SpeedMode, tier: ModelTier,
                 long_context: bool = False, at_times: Iterable[datetime] = ()) -> list[Window]:
+        name = report_model(model, mode, long_context)
+        if scope is not None and not scope.matches(name, mode, tier):
+            return []
         indices = sorted({i for at in at_times for i in lookup.matching(at)})
         result = [writable_window(windows, i) for i in indices]
-        name = report_model(model, mode, long_context)
         if by_model is not None:
             if name not in by_model:
                 by_model[name] = empty_windows(windows)
@@ -1426,20 +1442,90 @@ def file_stamp(path: Path) -> str:
     return json.dumps([stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns])
 
 
-class MetricsCache:
+def validate_metrics_cache(connection: sqlite3.Connection, *, allow_empty: bool = False) -> None:
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    required = {"cache_files", "cache_groups", "cache_threads", "cache_turns", "cache_usage",
+                "cache_calls", "cache_billing"}
+    if version not in (0, CACHE_VERSION):
+        raise ValueError("unsupported metrics cache version; use a new --cache path")
+    if not tables and version == 0 and allow_empty:
+        return
+    if version != CACHE_VERSION or not required.issubset(tables):
+        raise ValueError("cache path contains a different database; choose a separate --cache path")
+
+
+class MetricsReader:
+    """Hydrate normalized facts without initializing or writing the database."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        validate_metrics_cache(connection)
+        self.connection = connection
+
+    def threads(self, quality: Quality, harness: Harness | None = None,
+                span: tuple[datetime, datetime] | None = None) -> Iterator[Thread]:
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if harness is not None:
+            clauses.append("cache_key IN (SELECT cache_key FROM cache_threads WHERE harness=?)")
+            parameters.append(harness.value)
+        if span is not None:
+            # Select candidates by activity, then load whole conversations for attribution.
+            candidates = []
+            for table, column in (("cache_turns", "start"), ("cache_turns", "end"),
+                                  ("cache_usage", "at"), ("cache_calls", "at")):
+                candidates.append(f"SELECT cache_key FROM {table} WHERE {column} BETWEEN ? AND ?")
+                parameters.extend(at.isoformat() for at in span)
+            clauses.append("cache_key IN (" + " UNION ".join(candidates) + ")")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        groups = self.connection.execute(
+            "SELECT cache_key, manifest FROM cache_groups" + where + " ORDER BY rowid", parameters)
+        for key, manifest in groups:
+            loaded = self.load(key, manifest, quality)
+            if loaded is None:
+                raise ValueError("metrics cache changed while reading; refresh and retry")
+            yield from loaded
+
+    def load(self, key: str, manifest: str, quality: Quality) -> list[Thread] | None:
+        row = self.connection.execute("SELECT manifest, counts, warnings FROM cache_groups WHERE cache_key=?",
+                                      (key,)).fetchone()
+        if row is None or row[0] != manifest:
+            return None
+        quality.counts.update(json.loads(row[1]))
+        quality.warnings.extend(json.loads(row[2])[:max(0, 20 - len(quality.warnings))])
+        threads = {thread_id: Thread(thread_id, harness=Harness(harness)) for thread_id, harness in
+                   self.connection.execute("SELECT thread_id, harness FROM cache_threads WHERE cache_key=? ORDER BY rowid", (key,))}
+        for row in self.connection.execute(
+                "SELECT thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted "
+                "FROM cache_turns WHERE cache_key=? ORDER BY rowid", (key,)):
+            thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted = row
+            threads[thread_id].turns[turn_id] = Turn(
+                turn_id, start=datetime.fromisoformat(start) if start else None,
+                end=datetime.fromisoformat(end) if end else None, duration=duration, ttft=ttft,
+                model=model, mode=SpeedMode(mode), completed=bool(completed), aborted=bool(aborted))
+        for row in self.connection.execute(
+                "SELECT thread_id, turn_id, at, model, event_key, mode, aggregate, input, output, cached, "
+                "reasoning, cache_write, write_hour FROM cache_usage WHERE cache_key=? ORDER BY rowid", (key,)):
+            thread_id, turn_id, at, model, event_key, mode, aggregate, *counts = row
+            threads[thread_id].turns[turn_id].modern.append(UsageEvent(
+                datetime.fromisoformat(at), Usage(*(int(v) for v in counts)), model, event_key,
+                SpeedMode(mode), bool(aggregate)))
+        for thread_id, call_id, at, turn_id, model, mode in self.connection.execute(
+                "SELECT thread_id, call_id, at, turn_id, model, mode FROM cache_calls WHERE cache_key=? ORDER BY rowid", (key,)):
+            threads[thread_id].calls[call_id] = ToolCall(datetime.fromisoformat(at), turn_id, model, SpeedMode(mode))
+        for thread_id, at, unit, amount in self.connection.execute(
+                "SELECT thread_id, at, unit, amount FROM cache_billing WHERE cache_key=? ORDER BY rowid", (key,)):
+            threads[thread_id].billing.append(BillingEvent(datetime.fromisoformat(at), unit, Decimal(amount)))
+        return list(threads.values())
+
+
+class MetricsCache(MetricsReader):
     """SQLite stores parsed facts, never conversation text or calculated prices."""
 
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
         connection.execute("PRAGMA foreign_keys=ON")
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, CACHE_VERSION):
-            raise ValueError("unsupported metrics cache version; use a new --cache path or --no-cache")
-        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        cache_tables = {"cache_files", "cache_groups", "cache_threads", "cache_turns", "cache_usage",
-                        "cache_calls", "cache_billing"}
-        if tables and (version == 0 or not cache_tables.issubset(tables)):
-            raise ValueError("cache path contains a different database; choose a separate --cache path")
+        validate_metrics_cache(connection, allow_empty=True)
         connection.executescript("""
             CREATE TABLE IF NOT EXISTS cache_files (
                 harness TEXT NOT NULL, path TEXT NOT NULL, stamp TEXT NOT NULL, identity TEXT NOT NULL,
@@ -1475,7 +1561,8 @@ class MetricsCache:
                 PRIMARY KEY (cache_key, thread_id, position),
                 FOREIGN KEY (cache_key, thread_id) REFERENCES cache_threads ON DELETE CASCADE);
         """)
-        connection.execute(f"PRAGMA user_version={CACHE_VERSION}")
+        if connection.execute("PRAGMA user_version").fetchone()[0] != CACHE_VERSION:
+            connection.execute(f"PRAGMA user_version={CACHE_VERSION}")
 
     def identity(self, path: Path, harness: Harness) -> str:
         stamp = file_stamp(path)
@@ -1509,38 +1596,6 @@ class MetricsCache:
             ) WHERE at <= ?
         """, (now.isoformat(),)).fetchone()
         return datetime.fromisoformat(row[0]) if row[0] else None
-
-    def load(self, key: str, manifest: str, quality: Quality) -> list[Thread] | None:
-        row = self.connection.execute("SELECT manifest, counts, warnings FROM cache_groups WHERE cache_key=?",
-                                      (key,)).fetchone()
-        if row is None or row[0] != manifest:
-            return None
-        quality.counts.update(json.loads(row[1]))
-        quality.warnings.extend(json.loads(row[2])[:max(0, 20 - len(quality.warnings))])
-        threads = {thread_id: Thread(thread_id, harness=Harness(harness)) for thread_id, harness in
-                   self.connection.execute("SELECT thread_id, harness FROM cache_threads WHERE cache_key=? ORDER BY rowid", (key,))}
-        for row in self.connection.execute(
-                "SELECT thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted "
-                "FROM cache_turns WHERE cache_key=? ORDER BY rowid", (key,)):
-            thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted = row
-            threads[thread_id].turns[turn_id] = Turn(
-                turn_id, start=datetime.fromisoformat(start) if start else None,
-                end=datetime.fromisoformat(end) if end else None, duration=duration, ttft=ttft,
-                model=model, mode=SpeedMode(mode), completed=bool(completed), aborted=bool(aborted))
-        for row in self.connection.execute(
-                "SELECT thread_id, turn_id, at, model, event_key, mode, aggregate, input, output, cached, "
-                "reasoning, cache_write, write_hour FROM cache_usage WHERE cache_key=? ORDER BY rowid", (key,)):
-            thread_id, turn_id, at, model, event_key, mode, aggregate, *counts = row
-            threads[thread_id].turns[turn_id].modern.append(UsageEvent(
-                datetime.fromisoformat(at), Usage(*(int(v) for v in counts)), model, event_key,
-                SpeedMode(mode), bool(aggregate)))
-        for thread_id, call_id, at, turn_id, model, mode in self.connection.execute(
-                "SELECT thread_id, call_id, at, turn_id, model, mode FROM cache_calls WHERE cache_key=? ORDER BY rowid", (key,)):
-            threads[thread_id].calls[call_id] = ToolCall(datetime.fromisoformat(at), turn_id, model, SpeedMode(mode))
-        for thread_id, at, unit, amount in self.connection.execute(
-                "SELECT thread_id, at, unit, amount FROM cache_billing WHERE cache_key=? ORDER BY rowid", (key,)):
-            threads[thread_id].billing.append(BillingEvent(datetime.fromisoformat(at), unit, Decimal(amount)))
-        return list(threads.values())
 
     def store(self, key: str, manifest: str, threads: list[Thread], quality: Quality) -> None:
         # Replacing an affected group atomically also handles rewrites, copies and truncation.
@@ -1592,6 +1647,8 @@ class PreparedSources:
     threads: Iterator[Thread]
     files: set[Path]
     first_at: datetime | None
+    cache: MetricsCache
+    uncached_groups: int = 0
 
 
 @contextmanager
@@ -1687,7 +1744,8 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                                 raise ValueError("metrics cache changed while generating the report; rerun the command")
                             yield from loaded
 
-                yield PreparedSources(threads(), all_paths, first)
+                yield PreparedSources(threads(), all_paths, first, cache,
+                                      sum(group.uncached is not None for group in prepared))
 
 
 def collect_report(root: Path, now: datetime | None = None, progress: bool = False,
@@ -1762,11 +1820,12 @@ def render_report(report: dict[str, Any]) -> str:
     return HTML.replace("__REPORT_DATA__", data)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def argument_parser(*, static: bool = True, description: str | None = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description or __doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("directory", nargs="?", type=Path,
                         help="Codex archive directory; supplying one disables automatic local source discovery")
-    parser.add_argument("--output", type=Path, default=Path("harness_metrics.html"), help="HTML output (default: harness_metrics.html)")
+    if static:
+        parser.add_argument("--output", type=Path, default=Path("harness_metrics.html"), help="HTML output (default: harness_metrics.html)")
     parser.add_argument("--timezone", type=report_timezone, default=TIMEZONE,
                         help=f"calendar window timezone (default: {TIMEZONE}; UTC works without timezone data)")
     parser.add_argument("--harness", action="append", choices=[h.value for h in Harness],
@@ -1776,21 +1835,25 @@ def main() -> int:
     parser.add_argument("--opencode-dir", type=Path, help="OpenCode data directory or opencode.db path")
     cache_options = parser.add_mutually_exclusive_group()
     cache_options.add_argument("--cache", type=Path, help="SQLite metrics cache path (default: user cache directory)")
-    cache_options.add_argument("--no-cache", action="store_true", help="read logs directly without a persistent cache")
+    if static:
+        cache_options.add_argument("--no-cache", action="store_true", help="read logs directly without a persistent cache")
     pricing_options = parser.add_mutually_exclusive_group()
     pricing_options.add_argument("--openrouter-prices", type=Path,
                                  help="saved /api/v1/models JSON catalog (default: bundled openrouter_prices.json)")
     pricing_options.add_argument("--live-prices", action="store_true",
                                  help="fetch OpenRouter pricing; fall back to bundled prices if unavailable")
     parser.add_argument("--offline", action="store_true", help="use local pricing only (the default); incompatible with --live-prices")
-    args = parser.parse_args()
-    if args.offline and args.live_prices:
-        parser.error("--offline cannot be combined with --live-prices")
+    return parser
+
+
+def default_cache_path() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "harness-report" / "metrics.sqlite3"
+
+
+def source_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> dict[Harness, list[Path]]:
     root = args.directory if args.directory is not None else Path.cwd()
     if not root.is_dir():
         parser.error(f"not a directory: {root}")
-    if args.output.suffix.lower() != ".html":
-        parser.error("output must have an .html extension")
     selected = {Harness(name) for name in args.harness} if args.harness else set(Harness)
     home = Path.home()
     defaults = {Harness.CLAUDE: Path(os.environ.get("CLAUDE_CONFIG_DIR", str(home / ".claude"))) / "projects",
@@ -1812,6 +1875,16 @@ def main() -> int:
         existing = [p for p in candidates if p.exists()]
         if existing:
             harness_roots[harness] = existing
+    if Harness.CODEX in selected:
+        codex_roots = [home / ".codex" / name for name in ("sessions", "archived_sessions")]
+        harness_roots[Harness.CODEX] = [root] + ([path for path in codex_roots if path.is_dir()]
+                                               if args.directory is None else [])
+    return harness_roots
+
+
+def load_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[dict[str, Price], dict[str, Any]]:
+    if args.offline and args.live_prices:
+        parser.error("--offline cannot be combined with --live-prices")
     snapshot_path = args.openrouter_prices or BUNDLED_OPENROUTER_PRICES
     try:
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
@@ -1833,15 +1906,26 @@ def main() -> int:
         except (OSError, ValueError, UnicodeError) as error:
             print(f"Live OpenRouter prices unavailable: {error}; using bundled prices", file=sys.stderr)
             catalog_metadata["error"] = str(error)
+    return catalog, catalog_metadata
+
+
+def main() -> int:
+    parser = argument_parser()
+    args = parser.parse_args()
+    if args.offline and args.live_prices:
+        parser.error("--offline cannot be combined with --live-prices")
+    sources = source_paths(args, parser)
+    root = args.directory if args.directory is not None else Path.cwd()
+    if args.output.suffix.lower() != ".html":
+        parser.error("output must have an .html extension")
+    catalog, catalog_metadata = load_catalog(args, parser)
     try:
-        codex_roots = [home / ".codex" / name for name in ("sessions", "archived_sessions")]
         report = collect_report(root, progress=True,
-                                additional_roots=[path for path in codex_roots if path.is_dir()] if args.directory is None else [],
-                                harness_roots=harness_roots, include_codex=Harness.CODEX in selected,
+                                additional_roots=sources.get(Harness.CODEX, [])[1:],
+                                harness_roots={h: paths for h, paths in sources.items() if h != Harness.CODEX},
+                                include_codex=Harness.CODEX in sources,
                                 catalog=catalog, catalog_metadata=catalog_metadata, report_zone=args.timezone,
-                                cache_path=None if args.no_cache else args.cache or
-                                Path(os.environ.get("XDG_CACHE_HOME", str(home / ".cache"))) /
-                                "harness-report" / "metrics.sqlite3")
+                                cache_path=None if args.no_cache else args.cache or default_cache_path())
         args.output.write_text(render_report(report), encoding="utf-8")
     except (OSError, sqlite3.Error, ValueError) as error:
         print(f"Unable to generate report: {error}", file=sys.stderr)

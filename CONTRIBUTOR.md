@@ -4,7 +4,7 @@ Contributions can improve harness compatibility, usage accounting, pricing, repo
 
 ## Set up your workspace
 
-Fork the repository on GitHub, clone your fork, and create a branch for your change. Python 3.10 or later is required. The project uses the standard library; no dependency installation or build step is needed.
+Fork the repository on GitHub, clone your fork, and create a branch for your change. Python 3.10 or later is required. The static generator uses the standard library; no dependency installation or build step is needed. The optional dashboard server uses the dependencies in `requirements-server.txt`.
 
 Run commands from the repository root:
 
@@ -22,6 +22,9 @@ Keep one fix or feature per branch. For larger changes, describe the proposed be
 | --- | --- |
 | `harness_metrics.py` | CLI, storage readers, typed domain models, pricing, aggregation, and rendering. |
 | `test_harness_metrics.py` | Synthetic JSONL and SQLite fixtures, unit tests, and CLI integration tests. |
+| `harness_server.py` | FastAPI server, refresh snapshots, typed responses, and lazy chart queries. |
+| `harness_dashboard.html` | Lean dashboard with local styles and JavaScript that requests the REST API. |
+| `test_harness_server.py` | Optional API, cache consistency, and static-calculation parity tests. |
 | `README.md` | Installation, usage, report interpretation, and troubleshooting. |
 | `AGENTS.md` | Repository coding and workflow guidelines. |
 
@@ -49,6 +52,8 @@ python3 -m unittest discover -v
 ```
 
 Test modules use `test_*.py`; test methods use `test_*`. Use `unittest`, temporary directories, fixed timestamps, synthetic records, and mocked network requests. Add regression checks that assert the corrected behavior, including totals, diagnostics, source isolation, or boundary handling as relevant. No numeric coverage threshold is configured.
+
+Install `requirements-server.txt` in a virtual environment to include server tests, then run `python3 -m unittest discover -v`. Server tests use real HTTP requests against an ephemeral loopback port and synthetic databases, with no additional test dependencies. They skip when FastAPI/Uvicorn are unavailable. Use `python3 harness_server.py` to inspect the dashboard at `http://localhost:3050`; use synthetic sources and a separate cache for screenshots.
 
 For timezone or startup changes, also test without timezone data:
 
