@@ -1552,6 +1552,134 @@ class HarnessTests(unittest.TestCase):
             db.execute("INSERT INTO part VALUES (?, ?, ?, ?)", ("p1", "m1", "same-id", json.dumps({"type": "tool", "callID": "c1", "state": {"status": "completed"}})))
         return path
 
+    def t3_db(self, sessions=(("codex", "same-id"),), name="t3/state.sqlite", v2=False):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(path)) as db, db:
+            if v2:
+                db.execute("CREATE TABLE orchestration_v2_projection_provider_threads (provider TEXT, payload_json TEXT)")
+                for provider, identifier in sessions:
+                    db.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?)",
+                               (provider, json.dumps({"nativeThreadRef": {"nativeId": identifier}})))
+            else:
+                db.execute("CREATE TABLE provider_session_runtime (provider_name TEXT, resume_cursor_json TEXT)")
+                for provider, identifier in sessions:
+                    field = "threadId" if provider == "codex" else "sessionId"
+                    db.execute("INSERT INTO provider_session_runtime VALUES (?, ?)",
+                               (provider, json.dumps({field: identifier})))
+        return path
+
+    def test_t3_attributes_native_sessions_once_and_preserves_metrics(self):
+        self.write(prefix(thread="same-id") + [modern(), complete()], "codex/t3.jsonl")
+        self.write(prefix(thread="standalone") + [modern(), complete()], "codex/standalone.jsonl")
+        self.write([self.claude()], "claude/session.jsonl")
+        sources = {metrics.Harness.CLAUDE: [self.root / "claude"],
+                   metrics.Harness.OPENCODE: [self.opencode_db()]}
+        expected = self.report(sources)
+        db = self.t3_db((("codex", "same-id"), ("claude", "same-id"), ("opencode", "same-id")))
+        before = db.read_bytes()
+        sources[metrics.Harness.T3] = [db, db.parent]
+        report = self.report(sources)
+        self.assertEqual(db.read_bytes(), before)
+        self.assertEqual(report["windows"], expected["windows"])
+        self.assertEqual(report["by_model"], expected["by_model"])
+        self.assertEqual(report["by_harness"]["t3"]["windows"][0]["total_tokens"], 2700)
+        self.assertEqual(report["by_harness"]["codex"]["windows"][0]["total_tokens"], 1100)
+        self.assertEqual(report["by_harness"]["claude"]["windows"][0]["total_tokens"], 0)
+        self.assertEqual(report["by_harness"]["opencode"]["windows"][0]["total_tokens"], 0)
+
+    def test_t3_only_discovers_linked_native_logs_and_ignores_other_sessions(self):
+        self.write(prefix(thread="same-id") + [modern(), complete()], "home/.codex/sessions/t3.jsonl")
+        self.write(prefix(thread="other") + [modern(), complete()], "home/.codex/sessions/other.jsonl")
+        db = self.t3_db()
+        report = metrics.collect_report(self.root, NOW, include_codex=False,
+                                        harness_roots={metrics.Harness.T3: [db]})
+        self.assertEqual(set(report["by_harness"]), {"t3"})
+        window = report["windows"][0]
+        self.assertEqual(window["total_tokens"], 1100)
+        self.assertEqual(window["conversations"], 1)
+        self.assertEqual(window["metrics"]["ttft"]["avg"], .5)
+        self.assertEqual(Decimal(window["cost"]), Decimal(".00224"))
+
+    def test_t3_v2_native_references_do_not_use_internal_thread_ids(self):
+        self.write(prefix(thread="native") + [modern(), complete()], "codex/native.jsonl")
+        db = self.t3_db((("codex", "native"),), name="t3/statev2.sqlite", v2=True)
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?)",
+                               ("codex", json.dumps({"nativeThreadRef": {"nativeId": None}})))
+        report = self.report({metrics.Harness.T3: [db.parent]})
+        self.assertNotIn("Malformed records", report["quality"])
+        self.assertEqual(report["by_harness"]["t3"]["windows"][0]["total_tokens"], 1100)
+        self.assertEqual(report["by_harness"]["codex"]["windows"][0]["total_tokens"], 0)
+
+    def test_t3_claude_subagents_follow_parent_session(self):
+        self.write([self.claude()], "claude/session/subagents/agent-one.jsonl")
+        db = self.t3_db((("claude", "same-id"),))
+        report = self.report({metrics.Harness.T3: [db], metrics.Harness.CLAUDE: [self.root / "claude"]})
+        self.assertEqual(report["by_harness"]["t3"]["windows"][0]["total_tokens"], 800)
+        self.assertEqual(report["by_harness"]["claude"]["windows"][0]["total_tokens"], 0)
+
+    def test_t3_malformed_bindings_retain_valid_native_usage(self):
+        self.write(prefix(thread="same-id") + [modern(), complete()], "codex/session.jsonl")
+        db = self.t3_db()
+        with closing(sqlite3.connect(db)) as connection, connection:
+            for raw in ("{", "[]", '{"threadId": 123}'):
+                connection.execute("INSERT INTO provider_session_runtime VALUES (?, ?)", ("codex", raw))
+        with redirect_stderr(io.StringIO()):
+            report = self.report({metrics.Harness.T3: [db]})
+        self.assertEqual(report["quality"]["Malformed records"], 3)
+        self.assertEqual(report["by_harness"]["t3"]["windows"][0]["total_tokens"], 1100)
+
+    def test_t3_cache_refreshes_bindings_and_native_usage_without_duplicates(self):
+        self.write(prefix(thread="same-id") + [modern(), complete()], "codex/session.jsonl")
+        db = self.t3_db()
+        cache = self.root / "metrics.sqlite3"
+        sources = {metrics.Harness.T3: [db]}
+        def report():
+            return metrics.collect_report(self.root / "codex", NOW, harness_roots=sources, cache_path=cache)
+        expected = report()
+        with patch("harness_metrics.read_thread", side_effect=AssertionError("unchanged log parsed")):
+            self.assertEqual(report(), expected)
+        with closing(sqlite3.connect(db)) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute("DELETE FROM provider_session_runtime")
+            connection.commit()
+            changed = report()
+        self.assertEqual(changed["by_harness"]["t3"]["windows"][0]["total_tokens"], 0)
+        self.assertEqual(changed["by_harness"]["codex"]["windows"][0]["total_tokens"], 1100)
+        with closing(sqlite3.connect(cache)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM cache_threads").fetchone()[0], 1)
+        # Changing source selection must restore native attribution in a warm cache.
+        restored = metrics.collect_report(self.root / "codex", NOW, cache_path=cache)
+        self.assertEqual(set(restored["by_harness"]), {"codex"})
+        self.assertEqual(restored["windows"][0]["total_tokens"], 1100)
+
+    def test_t3_cache_cannot_overwrite_source_database(self):
+        db = self.t3_db()
+        before = db.read_bytes()
+        with self.assertRaisesRegex(ValueError, "separate from harness storage"):
+            metrics.collect_report(self.root, NOW, include_codex=False,
+                                   harness_roots={metrics.Harness.T3: [db.parent]}, cache_path=db)
+        self.assertEqual(db.read_bytes(), before)
+
+    def test_cli_t3_default_discovery_and_explicit_source(self):
+        db = self.t3_db(name="home/.t3/userdata/state.sqlite")
+        self.write(prefix(thread="same-id") + [modern(), complete()], "home/.codex/sessions/t3.jsonl")
+        for options in ([], [str(self.root), "--t3-dir", str(db)]):
+            with self.subTest(options=options):
+                output = self.root / "report.html"
+                with patch("sys.argv", ["harness_metrics.py", *options, "--harness", "t3", "--no-cache",
+                                        "--timezone", "UTC", "--output", str(output)]), \
+                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(metrics.main(), 0)
+                report = json.loads(output.read_text().split('id="report-data">')[1].split('</script>')[0])
+                self.assertEqual(set(report["by_harness"]), {"t3"})
+                self.assertEqual(report["windows"][0]["total_tokens"], 1100)
+        parser = metrics.argument_parser()
+        paths = metrics.source_paths(parser.parse_args([str(self.root)]), parser)
+        self.assertNotIn(metrics.Harness.T3, paths)
+
     def catalog(self):
         return metrics.openrouter_prices({"data": [
             {"id": "anthropic/claude-haiku-4.5", "pricing": {"prompt": ".000001", "completion": ".000005", "input_cache_read": ".0000001"}},

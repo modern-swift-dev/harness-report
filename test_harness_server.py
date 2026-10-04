@@ -100,6 +100,34 @@ class ServerTests(unittest.TestCase):
         self.assertEqual([point.model_dump() if point else None for point in actual.points], [point for _, point in expected])
         return actual
 
+    def test_t3_refresh_reclassifies_cached_usage_without_double_counting(self):
+        helper = fixtures.HarnessTests()
+        helper.root = self.root
+        t3 = helper.t3_db((("codex", "root"), ("claude", "same-id")))
+        before = self.service.dashboard(self.metadata.snapshot, server.ReportWindow.TODAY, server.Scope())
+        self.sources[metrics.Harness.T3] = [t3]
+        metadata = self.service.refresh()
+        self.assertIn(metrics.Harness.T3, metadata.harnesses)
+        combined = self.service.dashboard(metadata.snapshot, server.ReportWindow.TODAY, server.Scope())
+        self.assertEqual(combined.windows, before.windows)
+        scope = server.Scope(harness=metrics.Harness.T3)
+        actual = self.service.dashboard(metadata.snapshot, server.ReportWindow.TODAY, scope)
+        expected = self.static_report()['by_harness']['t3']['windows'][0]
+        self.assertEqual(actual.windows[0].model_dump(), expected)
+        self.assertEqual(actual.windows[0].total_tokens, 1900)
+        with closing(sqlite3.connect(t3)) as db, db:
+            db.execute("INSERT INTO provider_session_runtime VALUES (?, ?)", ('codex', '{'))
+        metadata = self.service.refresh()
+        self.assertEqual(metadata.quality['Malformed records'], 1)
+
+    def test_t3_unreadable_database_retains_previous_snapshot(self):
+        path = self.root / 'invalid.sqlite'
+        path.write_text('not a SQLite database')
+        self.sources[metrics.Harness.T3] = [path]
+        with self.assertRaisesRegex(ValueError, 'could not be read'):
+            self.service.refresh()
+        self.assertEqual(self.service.current().metadata.snapshot, self.metadata.snapshot)
+
     def test_summary_and_combined_filters_match_static_report(self):
         report = self.static_report()
         for harness in (None, *self.sources):

@@ -1,13 +1,13 @@
 # Harness Report
 
-Generate an interactive HTML usage report from local **Codex, Claude Code, Copilot CLI, and OpenCode** session data. Explore token counts, estimated API costs, tool calls, and timing statistics by harness, model, model tier, and speed mode.
+Generate an interactive HTML usage report from local **Codex, Claude Code, Copilot CLI, OpenCode, and T3 Code** session data. Explore token counts, estimated API costs, tool calls, and timing statistics by harness, model, model tier, and speed mode.
 
 The script reads session storage without modifying it. Each static report includes its data and visual assets and can be opened offline. An optional local dashboard loads summaries and chart series on demand from the SQLite metrics cache.
 
 ## Requirements
 
 - Python 3.10 or later; static reports require no third-party Python packages. The optional server dependencies are listed in `requirements-server.txt`.
-- Local session logs or an OpenCode database in a supported format.
+- Local session logs or an OpenCode/T3 Code database in a supported format.
 - A browser with JavaScript enabled to view the report.
 
 Named timezones require timezone data available to Python. `UTC` always works; the default is `America/Toronto` when available, otherwise UTC.
@@ -38,6 +38,7 @@ Without a directory argument, the script scans the current directory for Codex J
 | Claude Code | `~/.claude/projects` |
 | Copilot CLI | `~/.copilot/session-state` |
 | OpenCode | `~/.local/share/opencode/opencode.db` |
+| T3 Code | `~/.t3/userdata/state.sqlite` and `statev2.sqlite`, linked to native provider logs |
 
 `CLAUDE_CONFIG_DIR` changes the Claude configuration root; its `projects` subdirectory is scanned. `XDG_DATA_HOME` changes OpenCode's data root; the script looks under `opencode`.
 
@@ -115,6 +116,17 @@ python3 harness_metrics.py --harness copilot --copilot-dir /path/to/session-stat
 python3 harness_metrics.py --harness opencode --opencode-dir /path/to/opencode.db --offline --output opencode.html
 ```
 
+Read only sessions linked to T3 Code:
+
+```sh
+python3 harness_metrics.py --harness t3 --offline --output t3.html
+python3 harness_metrics.py --harness t3 --t3-dir /path/to/state.sqlite --offline --output t3.html
+```
+
+[T3 Code](https://github.com/pingdotgg/t3code) drives native providers. The importer reads saved native session references from its legacy `state.sqlite` or current `statev2.sqlite` database, then uses the existing Codex, Claude Code, and OpenCode readers for usage and timing. Both T3 state and provider storage stay read-only. Linked sessions appear under `t3` instead of their provider when T3 is selected, so combined totals count them once. Claude subagents follow their parent's session reference. Other providers, sessions without saved native references, and missing native logs are outside T3 coverage; conversation text and context-window counters are not used to estimate missing usage.
+
+T3-only imports look for linked logs in the default native provider locations listed above. A copied T3 database alone is insufficient. To use a different provider archive, select that provider too and supply its source option; for example, `--harness t3 --harness claude --t3-dir /path/to/state.sqlite --claude-dir /path/to/projects`. The provider filter retains sessions unrelated to T3. A Codex directory argument supplies the Codex logs when Codex is selected. Both the static report and local dashboard support these options.
+
 Select multiple installed harnesses by repeating `--harness`:
 
 ```sh
@@ -130,10 +142,11 @@ python3 harness_metrics.py --help
 | Option | Purpose |
 | --- | --- |
 | `directory` | Optional Codex archive directory; disables automatic discovery. |
-| `--harness NAME` | Select `codex`, `claude`, `copilot`, or `opencode`; repeat to combine. |
+| `--harness NAME` | Select `codex`, `claude`, `copilot`, `opencode`, or `t3`; repeat to combine. |
 | `--claude-dir PATH` | Claude projects directory containing JSONL logs. |
 | `--copilot-dir PATH` | Copilot session directory containing JSONL events. |
 | `--opencode-dir PATH` | OpenCode data directory or database file. |
+| `--t3-dir PATH` | T3 Code base/userdata directory or state database file. |
 | `--output PATH` | HTML output; defaults to `harness_metrics.html`. The parent directory must exist. |
 | `--timezone NAME` | Timezone for calendar windows, such as `UTC` or `Europe/Paris`. |
 | `--cache PATH` | Persistent SQLite metrics cache; defaults to the user cache directory. |

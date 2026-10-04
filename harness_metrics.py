@@ -3,7 +3,7 @@
 
     python3 harness_metrics.py [directory] --output report.html
 
-Supports Codex, Claude Code, Copilot CLI, and OpenCode local storage.
+Supports Codex, Claude Code, Copilot CLI, OpenCode, and T3 Code local storage.
 With no directory, discovers installed harnesses; use --harness to select them.
 Codex discovery includes ~/.codex/sessions and ~/.codex/archived_sessions.
 An explicit directory reads only that Codex archive plus supplied source paths.
@@ -70,6 +70,7 @@ class Harness(str, Enum):
     CLAUDE = "claude"
     COPILOT = "copilot"
     OPENCODE = "opencode"
+    T3 = "t3"
 
 
 class Category(str, Enum):
@@ -1623,11 +1624,83 @@ class MetricsCache(MetricsReader):
                 for i, event in enumerate(thread.billing)])
 
 
-def source_manifest(paths: list[Path], harness: Harness) -> str:
+def t3_databases(paths: list[Path]) -> list[Path]:
+    databases: set[Path] = set()
+    for path in paths:
+        if path.is_dir():
+            # Accept either the T3 base directory or its userdata directory.
+            for directory in (path, path / "userdata"):
+                databases.update(p.resolve() for name in ("state.sqlite", "statev2.sqlite")
+                                 if (p := directory / name).is_file())
+        else:
+            databases.add(path.resolve())
+    return sorted(databases)
+
+
+def read_t3_sessions(paths: list[Path], quality: Quality) -> dict[Harness, set[str]]:
+    """Read native session references, never T3 message text or tool arguments."""
+    sessions: dict[Harness, set[str]] = defaultdict(set)
+    providers = {h.value: h for h in (Harness.CODEX, Harness.CLAUDE, Harness.OPENCODE)}
+    for path in paths:
+        try:
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
+                connection.execute("PRAGMA query_only=ON")
+                connection.execute("BEGIN")
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if not tables.intersection({"provider_session_runtime", "orchestration_v2_projection_provider_threads"}):
+                    raise ValueError("unsupported T3 Code database schema")
+                if "provider_session_runtime" in tables:
+                    for provider, raw in connection.execute(
+                            "SELECT provider_name, resume_cursor_json FROM provider_session_runtime"):
+                        if provider not in providers or raw is None:
+                            continue
+                        try:
+                            cursor = json.loads(raw)
+                        except (ValueError, TypeError):
+                            quality.warn("Malformed records", path, 0, "invalid T3 resume cursor; skipped")
+                            continue
+                        field = "threadId" if provider == "codex" else "sessionId"
+                        identifier = cursor.get(field) if isinstance(cursor, dict) else None
+                        if isinstance(identifier, str) and identifier:
+                            sessions[providers[provider]].add(identifier)
+                        elif not isinstance(cursor, dict) or identifier is not None:
+                            quality.warn("Malformed records", path, 0, "invalid T3 native session ID; skipped")
+                if "orchestration_v2_projection_provider_threads" in tables:
+                    for provider, raw in connection.execute(
+                            "SELECT provider, payload_json FROM orchestration_v2_projection_provider_threads"):
+                        if provider not in providers:
+                            continue
+                        try:
+                            payload = json.loads(raw)
+                        except (ValueError, TypeError):
+                            quality.warn("Malformed records", path, 0, "invalid T3 provider thread JSON; skipped")
+                            continue
+                        reference = payload.get("nativeThreadRef") if isinstance(payload, dict) else None
+                        identifier = reference.get("nativeId") if isinstance(reference, dict) else None
+                        if isinstance(identifier, str) and identifier:
+                            sessions[providers[provider]].add(identifier)
+                        elif (not isinstance(payload, dict) or
+                              reference is not None and not isinstance(reference, dict) or
+                              identifier is not None):
+                            quality.warn("Malformed records", path, 0, "invalid T3 native thread reference; skipped")
+        except (OSError, sqlite3.Error, ValueError) as error:
+            quality.warn("Unreadable files", path, 0, str(error))
+    return dict(sessions)
+
+
+def native_source_defaults() -> dict[Harness, list[Path]]:
+    home = Path.home()
+    return {Harness.CODEX: [home / ".codex" / name for name in ("sessions", "archived_sessions")],
+            Harness.CLAUDE: [Path(os.environ.get("CLAUDE_CONFIG_DIR", str(home / ".claude"))) / "projects"],
+            Harness.COPILOT: [home / ".copilot" / "session-state"],
+            Harness.OPENCODE: [Path(os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share"))) / "opencode"]}
+
+
+def source_manifest(paths: list[Path], harness: Harness, attribution: str = "") -> str:
     stamps: list[tuple[str, str]] = []
     for path in paths:
-        stamps.append((str(path), file_stamp(path)))
-        if harness == Harness.OPENCODE:
+        stamps.append((str(path), file_stamp(path) + attribution))
+        if harness in (Harness.OPENCODE, Harness.T3):
             # Uncheckpointed SQLite writes live in the WAL, not the main database.
             wal = Path(str(path) + "-wal")
             stamps.append((str(wal), file_stamp(wal) if wal.exists() else "missing"))
@@ -1654,13 +1727,28 @@ class PreparedSources:
 @contextmanager
 def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progress: bool,
                     cache_path: Path | None, now: datetime) -> Iterator[PreparedSources]:
+    t3_paths = t3_databases(sources.get(Harness.T3, []))
     if cache_path:
-        for directory in sources.get(Harness.OPENCODE, []):
-            database = directory / "opencode.db" if directory.is_dir() else directory
+        opencode_paths = sources.get(Harness.OPENCODE, [])
+        if Harness.T3 in sources and Harness.OPENCODE not in sources:
+            opencode_paths = native_source_defaults()[Harness.OPENCODE]
+        databases = t3_paths + [directory / "opencode.db" if directory.is_dir() else directory
+                                for directory in opencode_paths]
+        for database in databases:
             if (database.resolve() == cache_path.resolve() or
                     database.exists() and cache_path.exists() and database.samefile(cache_path)):
                 raise ValueError("the metrics cache must be separate from harness storage")
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+    t3_quality = Quality()
+    try:
+        t3_manifest = source_manifest(t3_paths, Harness.T3)
+    except OSError:
+        t3_manifest = ""
+    t3_sessions = read_t3_sessions(t3_paths, t3_quality)
+    scan_sources = {h: paths for h, paths in sources.items() if h != Harness.T3}
+    for harness, defaults in native_source_defaults().items():
+        if harness in t3_sessions and harness not in scan_sources:
+            scan_sources[harness] = [path for path in defaults if path.exists()]
     # A temporary SQLite working database also bounds memory when persistent caching is disabled.
     temporary = tempfile.TemporaryDirectory(prefix="harness-report-") if cache_path is None else nullcontext(None)
     with temporary as directory:
@@ -1671,9 +1759,26 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                 connection.execute("BEGIN")
                 connection.execute("CREATE TEMP TABLE report_groups (cache_key TEXT PRIMARY KEY)")
                 prepared: list[PreparedGroup] = []
-                all_paths: set[Path] = set()
+                all_paths: set[Path] = set(t3_paths)
+                if t3_paths:
+                    key = json.dumps([Harness.T3.value, [str(path) for path in t3_paths]])
+                    try:
+                        stable = bool(t3_manifest) and t3_manifest == source_manifest(t3_paths, Harness.T3)
+                    except OSError:
+                        stable = False
+                    if stable and not t3_quality.counts["Unreadable files"]:
+                        cache.store(key, t3_manifest, [], t3_quality)
+                        prepared.append(PreparedGroup(key, t3_manifest))
+                        connection.execute("INSERT INTO report_groups VALUES (?)", (key,))
+                    else:
+                        prepared.append(PreparedGroup(key, t3_manifest, [], t3_quality))
                 readers = {Harness.CODEX: read_thread, Harness.CLAUDE: read_claude, Harness.COPILOT: read_copilot}
-                for harness, directories in sources.items():
+                for harness, directories in scan_sources.items():
+                    def attributed_harness(identifier: str) -> Harness:
+                        # Claude subagents use the parent's session ID plus a suffix.
+                        native_id = identifier.partition(":")[0] if harness == Harness.CLAUDE else identifier
+                        return Harness.T3 if native_id in t3_sessions.get(harness, set()) else harness
+
                     if harness in readers:
                         paths = sorted({p.resolve() for directory in directories for p in directory.rglob("*.jsonl")})
                         groups: dict[str, list[Path]] = defaultdict(list)
@@ -1682,7 +1787,9 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                                 identity = cache.identity(path, harness)
                             except OSError:
                                 identity = str(path)
-                            groups[identity].append(path)
+                            if attributed_harness(identity) in sources:
+                                groups[identity].append(path)
+                        paths = sorted({path for files in groups.values() for path in files})
                     else:
                         paths = sorted({(directory / "opencode.db" if directory.is_dir() else directory).resolve()
                                         for directory in directories})
@@ -1691,8 +1798,10 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                     parsed = 0
                     for index, (thread_id, files) in enumerate(groups.items(), 1):
                         key = json.dumps([harness.value, thread_id])
+                        attribution = (json.dumps([harness in sources, sorted(t3_sessions.get(harness, set()))])
+                                       if harness == Harness.OPENCODE else attributed_harness(thread_id).value)
                         try:
-                            manifest = source_manifest(files, harness)
+                            manifest = source_manifest(files, harness, attribution)
                         except OSError:
                             manifest = ""
                         count = cache.valid_count(key, manifest) if manifest else None
@@ -1704,6 +1813,11 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                             try:
                                 loaded = ([readers[harness](thread_id, files, group_quality)] if harness in readers
                                           else read_opencode(files, group_quality))
+                                for thread in loaded:
+                                    thread.harness = attributed_harness(thread.id)
+                                    if thread.harness == Harness.T3:
+                                        thread.id = f"{harness.value}:{thread.id}"
+                                loaded = [thread for thread in loaded if thread.harness in sources]
                             except (OSError, UnicodeError) as error:
                                 group_quality.warn("Unreadable files", files[0], 0, str(error))
                                 loaded = []
@@ -1711,7 +1825,7 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                             stable = False
                             if manifest and not group_quality.counts["Unreadable files"]:
                                 try:
-                                    stable = manifest == source_manifest(files, harness)
+                                    stable = manifest == source_manifest(files, harness, attribution)
                                 except OSError:
                                     pass
                             if stable:
@@ -1833,6 +1947,7 @@ def argument_parser(*, static: bool = True, description: str | None = None) -> a
     parser.add_argument("--claude-dir", type=Path, help="Claude projects directory (default: ~/.claude/projects)")
     parser.add_argument("--copilot-dir", type=Path, help="Copilot session-state directory (default: ~/.copilot/session-state)")
     parser.add_argument("--opencode-dir", type=Path, help="OpenCode data directory or opencode.db path")
+    parser.add_argument("--t3-dir", type=Path, help="T3 Code base/userdata directory or state database path (default: ~/.t3/userdata)")
     cache_options = parser.add_mutually_exclusive_group()
     cache_options.add_argument("--cache", type=Path, help="SQLite metrics cache path (default: user cache directory)")
     if static:
@@ -1856,11 +1971,10 @@ def source_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> d
         parser.error(f"not a directory: {root}")
     selected = {Harness(name) for name in args.harness} if args.harness else set(Harness)
     home = Path.home()
-    defaults = {Harness.CLAUDE: Path(os.environ.get("CLAUDE_CONFIG_DIR", str(home / ".claude"))) / "projects",
-                Harness.COPILOT: home / ".copilot" / "session-state",
-                Harness.OPENCODE: Path(os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share"))) / "opencode"}
+    defaults = {harness: paths[0] for harness, paths in native_source_defaults().items()}
+    defaults[Harness.T3] = home / ".t3" / "userdata"
     supplied = {Harness.CLAUDE: args.claude_dir, Harness.COPILOT: args.copilot_dir,
-                Harness.OPENCODE: args.opencode_dir}
+                Harness.OPENCODE: args.opencode_dir, Harness.T3: args.t3_dir}
     harness_roots: dict[Harness, list[Path]] = {}
     for harness in selected - {Harness.CODEX}:
         explicit = supplied[harness]
@@ -1873,6 +1987,11 @@ def source_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> d
         else:
             candidates = []
         existing = [p for p in candidates if p.exists()]
+        if harness == Harness.T3:
+            databases = t3_databases(existing)
+            if explicit and not databases:
+                parser.error(f"missing T3 Code state database in: {explicit}")
+            existing = databases
         if existing:
             harness_roots[harness] = existing
     if Harness.CODEX in selected:
@@ -1981,7 +2100,7 @@ HTML = r'''<!doctype html>
 <p class="definition"><b>Model attribution.</b> Fast usage has a separate model entry with a “-fast” suffix. Requests crossing a published context-pricing threshold have a “-long” suffix, including cached input when selecting the threshold; combined usage has “-fast-long”. Usage below the threshold keeps the model name unless Fast. Models without context pricing and aggregate records without per-request sizes do not receive “-long”. Tokens, calls, timing, and costs are separated by recorded mode, with the Fast premium applied to the underlying model's rates. Tokens and calls use their recorded model, falling back to the turn model. Timing uses the model generating that turn. Conversation duration and tool counts include only that model's activity; a thread using multiple models or modes appears in each, so conversation counts are not additive. If several models generate output within one turn, its timing is listed under “Mixed models (timing)”. If one model uses several modes within a turn, its timing is listed under “Mixed modes (timing)” because separate durations cannot be recovered. If one model in one mode crosses context thresholds within a turn, its timing is listed under “Mixed contexts (timing)”. Tool calls follow the context class of matching model and mode usage in their turn; ambiguous calls are listed under “Mixed contexts (tools)”. Mode and tier totals retain this activity once.</p>
 <p class="definition"><b>Model tiers.</b> Budget: Luna, Terra, GPT-5.4-mini, Spark, codex-auto-review, and Claude Haiku. Medium: Sol, GPT-5.4, GPT-5.5, and Claude Sonnet. High: Astra, Claude Opus, Fable, and Mythos. Models outside these groups are Unclassified. Tier metrics are calculated from underlying activity, with each conversation counted once per tier. Turns using several models in the same tier retain their timing in that tier; turns spanning tiers have timing under “Mixed tiers (timing)”. Per-model pricing and the Fast premium still apply. The model selector and comparison table show entries with recorded tokens in the selected window, harness, tier, and mode. Zero-token entries, including shared timing and tool-call buckets, remain included in aggregate totals and coverage.</p>
 <p class="definition"><b>Mode attribution.</b> Logged service tier “default” is Normal; “priority” or “fast” is Fast. Settings persist until changed. Per the selected assumption, unknown mode—including missing evidence, explicit null, and “auto”—is counted as Normal in all metrics and costs. Other explicit tiers have their own bucket. Tokens and calls follow their recorded tier or the latest logged settings. This combines logged mode with the Normal assumption; a backend fallback cannot be detected without a response tier. A turn with usage in several modes has its timing under “Mixed modes (timing)” because separate durations are unavailable. Conversation durations and calls include only activity attributed to the selected mode.</p>
-<p class="definition"><b>Harness coverage.</b> Claude Code reads project JSONL files, Copilot reads CLI session events, and OpenCode reads its message and tool tables. Copilot shutdown-only totals are assigned to shutdown, which does not establish when individual requests occurred. Timing samples require logged timing evidence.</p>
+<p class="definition"><b>Harness coverage.</b> Claude Code reads project JSONL files, Copilot reads CLI session events, and OpenCode reads its message and tool tables. T3 Code links saved native sessions to the Codex, Claude Code, and OpenCode readers; linked sessions count once under T3 when selected. Missing native logs and other T3 providers are outside coverage. Copilot shutdown-only totals are assigned to shutdown, which does not establish when individual requests occurred. Timing samples require logged timing evidence.</p>
 <p class="definition"><b>Coverage.</b> Logs in the listed input directories include archived and active sessions. Copies sharing a conversation ID are merged; repeated usage responses, tool calls, and turn completions are counted once. Active logs are read while they may still be growing; the report cutoff limits included activity. Unfinished turns contribute recorded tokens and calls, with completion timings excluded. An older-window label does not imply a complete year of available history. Missing durations are excluded, so conversation duration can be partial.</p>
 <p class="definition"><b>Cost estimate.</b> Current standard API rates are applied to every historical window, with an assumed 50% premium on OpenAI token categories recorded in Fast mode. Normal, including assumed Normal activity, uses base rates. Other explicit tiers also use base rates; their actual premiums are unknown. Codex 5.3 Spark uses GPT-5.4-mini rates and codex-auto-review uses GPT-5.6-luna rates as user-selected proxies, not published prices for those models. These are API-equivalent estimates, not subscription bills. Claude cache writes include separate 5-minute and 1-hour rates when logged; Claude Fast uses its published model-specific premium. Unpublished Fast rates remain unpriced. OpenRouter catalog rates price matched models lacking an embedded rate table. OpenCode input/cache and output/reasoning counters are normalized to avoid overlap. Recorded harness costs and billing units are shown separately below. Subscription charges, tool fees, and regional uplifts are excluded. Reasoning is split out of output; cache reads/writes are split out of input. OpenAI long-context rates apply above 272,000 input tokens where published. Older Claude Sonnet rates change above 200,000; Claude 4.6+ uses standard rates throughout its context window. OpenRouter context thresholds come from the catalog. Aggregate counters without per-request sizes assume normal-context rates, including the base OpenRouter rates without context overrides. Recorded speed-mode premiums still apply where known; actual long-context costs may be higher.</p>
 </div><div><h3>Selected-window coverage</h3><div class="table-wrap"><table id="coverage"></table></div><h3 style="margin-top:18px">Unpriced usage</h3><div id="unpriced"></div></div></div>
