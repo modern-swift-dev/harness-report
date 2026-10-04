@@ -163,7 +163,11 @@ class ServerTests(unittest.TestCase):
         for scope in scopes:
             for interval in metrics.Granularity:
                 with self.subTest(scope=scope, interval=interval):
-                    self.assert_trend_parity(report, scope, interval)
+                    series = self.assert_trend_parity(report, scope, interval)
+                    group = self.static_group(report, scope)
+                    windows = group['by_model'][scope.model] if scope.model else group['windows']
+                    self.assertEqual(sum(point.total_tokens for point in series.points if point),
+                                     windows[-1]['total_tokens'])
         timing = self.service.trends(self.metadata.snapshot, self.metadata.first_date, self.metadata.cutoff_date,
                                      metrics.Granularity.DAILY, scopes[-2])
         self.assertEqual(sum(point.ttft.count for point in timing.points if point), 1)

@@ -62,6 +62,10 @@ class MetricSummary(BaseModel):
     tools: Distribution
 
 
+class TrendPoint(MetricSummary):
+    total_tokens: int
+
+
 class Period(BaseModel):
     label: str
     start: str
@@ -155,7 +159,7 @@ class TrendResponse(BaseModel):
     scope: Scope
     granularity: metrics.Granularity
     periods: list[Period]
-    points: list[MetricSummary | None]
+    points: list[TrendPoint | None]
     range_start: str
     range_end: str
 
@@ -393,7 +397,7 @@ class DashboardService:
                 periods=[Period(label=window.label, start=window.start.astimezone(zone).isoformat(),
                                 end=window.end.astimezone(zone).isoformat(), end_exclusive=window.end_exclusive)
                          for window in windows],
-                points=[MetricSummary(**metrics.metric_summary(window)) if window.conversations else None
+                points=[TrendPoint(**point) if (point := metrics.trend_summary(window)) is not None else None
                         for window in windows], range_start=range_start.isoformat(),
                 range_end=min(end_local.astimezone(timezone.utc), now).isoformat())
             size = len(response.model_dump_json().encode('utf-8'))

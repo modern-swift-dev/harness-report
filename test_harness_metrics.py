@@ -739,7 +739,9 @@ class ReportTests(unittest.TestCase):
         periods = report["trend_periods"]["hourly"]
         points = dict(zip((p["label"] for p in periods), report["trends"]["hourly"]))
         self.assertEqual(points["2026-10-03T09:00+00:00"]["ttft"]["count"], 0)
+        self.assertEqual(points["2026-10-03T09:00+00:00"]["total_tokens"], 340)
         completed = points["2026-10-03T10:00+00:00"]
+        self.assertEqual(completed["total_tokens"], 0)
         self.assertEqual(completed["ttft"]["avg"], 2)
         self.assertEqual(completed["throughput"]["avg"], 2)
         self.assertEqual(completed["length"]["avg"], 120)
@@ -749,6 +751,30 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(periods[-1]["end_exclusive"])
         self.assertIn('<option value="hourly">Hourly</option>', metrics.render_report(
             {**report, "generated": boundary.isoformat()}))
+
+    def test_token_trends_total_usage_once_per_period_and_respect_filters(self):
+        cutoff = datetime(2026, 10, 3, 12, tzinfo=timezone.utc)
+        events = [metrics.UsageEvent(at, metrics.Usage(100, 40, cached=20, reasoning=10, write=15),
+                                    model, str(index), mode=mode)
+                  for index, (at, model, mode) in enumerate([
+                      (cutoff - timedelta(days=3), "gpt-6.1-sol", metrics.SpeedMode.NORMAL),
+                      (cutoff - timedelta(days=1), "gpt-6-astra", metrics.SpeedMode.FAST),
+                      (cutoff, "gpt-6.1-sol", metrics.SpeedMode.NORMAL),
+                      (cutoff + timedelta(seconds=1), "gpt-6.1-sol", metrics.SpeedMode.NORMAL)])]
+        turn = metrics.Turn("unfinished", start=events[0].at, model="gpt-6.1-sol", modern=events)
+        report = metrics.build_breakdown([metrics.Thread("one", turns={turn.id: turn})],
+                                         cutoff, report_zone=timezone.utc)
+        for interval in metrics.Granularity:
+            key = interval.value
+            with self.subTest(interval=key):
+                self.assertEqual(sum(p["total_tokens"] for p in report["trends"][key] if p), 420)
+                self.assertEqual(sum(p["total_tokens"] for p in report["by_mode"]["Normal"]["trends"][key] if p), 280)
+                self.assertEqual(sum(p["total_tokens"] for p in report["by_tier"]["High"]["by_mode"]["Fast"]["trends"][key] if p), 140)
+                self.assertEqual(sum(p["total_tokens"] for p in report["by_model_trends"]["gpt-6.1-sol"][key] if p), 280)
+        daily = dict(zip((p["label"] for p in report["trend_periods"]["daily"]), report["trends"]["daily"]))
+        self.assertIsNone(daily["2026-10-01"])
+        self.assertEqual(daily["2026-10-03"]["total_tokens"], 140)
+        self.assertEqual(daily["2026-10-03"]["ttft"]["count"], 0)
 
     def test_hourly_trends_preserve_dst_skipped_and_repeated_hours(self):
         try:
@@ -772,13 +798,19 @@ class ReportTests(unittest.TestCase):
         for hour, ttft in ((5, 1), (6, 3)):
             at = datetime(2026, 11, 1, hour, 10, tzinfo=timezone.utc)
             turns[str(hour)] = metrics.Turn(str(hour), start=at, end=at + timedelta(seconds=10),
-                                            completed=True, duration=10, ttft=ttft)
+                                            completed=True, duration=10, ttft=ttft,
+                                            modern=[metrics.UsageEvent(at, metrics.Usage(hour * 100, 40),
+                                                                       "gpt-6.1-sol", str(hour))])
         report = metrics.build_breakdown([metrics.Thread("one", turns=turns)],
                                          datetime(2026, 11, 1, 8, tzinfo=timezone.utc), report_zone=toronto)
         repeated = [(p["label"], point["ttft"]["avg"]) for p, point in
                     zip(report["trend_periods"]["hourly"], report["trends"]["hourly"])
                     if "T01:00" in p["label"]]
         self.assertEqual(repeated, [("2026-11-01T01:00-04:00", 1), ("2026-11-01T01:00-05:00", 3)])
+        token_totals = [point["total_tokens"] for period, point in
+                        zip(report["trend_periods"]["hourly"], report["trends"]["hourly"])
+                        if "T01:00" in period["label"]]
+        self.assertEqual(token_totals, [540, 640])
 
     def test_hourly_empty_buckets_share_storage_without_leaking_between_filters(self):
         cutoff = datetime(2026, 10, 3, 12, tzinfo=timezone.utc)
