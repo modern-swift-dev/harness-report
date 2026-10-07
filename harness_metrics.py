@@ -33,7 +33,7 @@ import sqlite3
 import statistics
 import sys
 import tempfile
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -104,7 +104,7 @@ def model_tier(model: str | None) -> ModelTier:
         return (ModelTier.BUDGET if "haiku" in name else ModelTier.MEDIUM if "sonnet" in name
                 else ModelTier.HIGH if any(family in name for family in ("opus", "fable", "mythos"))
                 else ModelTier.UNCLASSIFIED)
-    if name == "gpt-5.4-mini":
+    if name.startswith("gpt-") and name.endswith(("-mini", "-nano")):
         return ModelTier.BUDGET
     if name in ("gpt-5.4", "gpt-5.5"):
         return ModelTier.MEDIUM
@@ -484,6 +484,14 @@ class Thread:
 CALL_TYPES = {"function_call", "custom_tool_call", "web_search_call", "tool_search_call"}
 
 
+def inherited_baseline(kind: str, payload: dict[str, Any], previous: Usage) -> Usage:
+    """Copied parent counters advance the child's baseline without adding usage."""
+    if kind != "event_msg" or payload.get("type") != "token_count":
+        return previous
+    cumulative = parse_usage((payload.get("info") or {}).get("total_token_usage"))
+    return previous if cumulative is None else cumulative
+
+
 def read_thread(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
     """Keep only compact metrics, discarding message text and tool arguments."""
     thread = Thread(thread_id)
@@ -502,7 +510,7 @@ def read_thread(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
         first_context: str | None = None
         prefix_turns: set[str] = set()
         call_turns: dict[str, str] = {}
-        with path.open("r", encoding="utf-8") as stream:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
             for index, line in enumerate(stream):
                 if not line.strip():
                     continue
@@ -551,17 +559,20 @@ def read_thread(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
                 # record, not the ordinal alone, establishes inherited history.
                 if inherited and index < history_boundary:
                     quality.counts["Inherited records excluded"] += 1
+                    previous = inherited_baseline(kind, payload, previous)
                     continue
                 explicit_thread = payload.get("thread_id")
                 if explicit_thread == thread_id:
                     inherited = False
                 elif explicit_thread and explicit_thread != thread_id:
                     quality.counts["Inherited records excluded"] += 1
+                    previous = inherited_baseline(kind, payload, previous)
                     continue
                 if history_boundary and index >= history_boundary:
                     inherited = False
                 if inherited:
                     quality.counts["Inherited records excluded"] += 1
+                    previous = inherited_baseline(kind, payload, previous)
                     continue
                 at = timestamp(row.get("timestamp"))
                 if kind not in {"turn_context", "event_msg", "response_item", "token_usage_record"}:
@@ -686,7 +697,7 @@ def read_thread(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
 
 
 def json_rows(path: Path, quality: Quality) -> Iterable[tuple[int, dict[str, Any]]]:
-    with path.open(encoding="utf-8") as stream:
+    with path.open(encoding="utf-8", errors="replace") as stream:
         for line_number, line in enumerate(stream, 1):
             if not line.strip():
                 continue
@@ -731,7 +742,7 @@ def read_claude(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
     for path in paths:
         for line, row in json_rows(path, quality):
             kind, message = row.get("type"), row.get("message")
-            if kind not in {"user", "assistant", "system"}:
+            if not isinstance(kind, str) or kind not in {"user", "assistant", "system"}:
                 continue
             at = timestamp(row.get("timestamp"))
             if at is None:
@@ -750,6 +761,10 @@ def read_claude(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
             elif kind == "assistant" and isinstance(message, dict):
                 turn = thread.turns.setdefault(current_turn, Turn(current_turn))
                 model = message.get("model") if isinstance(message.get("model"), str) else None
+                # Claude Code records local errors as "<synthetic>" messages with no real usage.
+                synthetic = model == "<synthetic>"
+                if synthetic:
+                    model = None
                 turn.model = model or turn.model
                 raw_usage = message.get("usage")
                 mode = SpeedMode.FAST if isinstance(raw_usage, dict) and raw_usage.get("speed") == "fast" else SpeedMode.NORMAL
@@ -758,20 +773,21 @@ def read_claude(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("id"), str):
                             thread.calls.setdefault(block["id"], ToolCall(at, current_turn, model, mode))
-                if "usage" in message:
-                    usage = separate_usage(message["usage"])
-                    if usage is None:
-                        quality.warn("Invalid usage records", path, line, "invalid Claude token usage; skipped")
-                        continue
-                    key = str(row.get("requestId") or message.get("id") or row.get("uuid") or hashlib.sha256(json.dumps(row).encode()).hexdigest())
-                    old = responses.get(key)
-                    # Streaming records repeat request usage. Keep the fullest
-                    # valid response rather than charging once per content block.
-                    if old:
-                        quality.counts["Duplicate usage records excluded"] += 1
-                    if old is None or usage.output >= old[1].usage.output:
-                        responses[key] = (current_turn, UsageEvent(at, usage, model, key, mode))
-                if message.get("stop_reason") in {"end_turn", "stop_sequence"}:
+                usage = separate_usage(message["usage"]) if "usage" in message else None
+                if "usage" in message and usage is None:
+                    quality.warn("Invalid usage records", path, line, "invalid Claude token usage; skipped")
+                elif usage is not None:
+                    if not synthetic or usage.total:
+                        key = str(row.get("requestId") or message.get("id") or row.get("uuid") or hashlib.sha256(json.dumps(row).encode()).hexdigest())
+                        old = responses.get(key)
+                        # Streaming records repeat request usage. Keep the fullest
+                        # valid response rather than charging once per content block.
+                        if old:
+                            quality.counts["Duplicate usage records excluded"] += 1
+                        if old is None or usage.output >= old[1].usage.output:
+                            responses[key] = (current_turn, UsageEvent(at, usage, model, key, mode))
+                stop_reason = message.get("stop_reason")
+                if isinstance(stop_reason, str) and stop_reason in {"end_turn", "stop_sequence"}:
                     turn.end, turn.completed = at, True
             elif kind == "system" and row.get("subtype") == "turn_duration":
                 turn = thread.turns.setdefault(current_turn, Turn(current_turn))
@@ -802,6 +818,7 @@ def read_copilot(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
     thread = Thread(thread_id, harness=Harness.COPILOT)
     current_turn, model = "unattributed", None
     seen: set[str] = set()
+    seen_responses: set[str] = set()
     summaries: dict[str, tuple[datetime, dict[str, Any]]] = {}
     for path in paths:
         for line, row in json_rows(path, quality):
@@ -858,9 +875,10 @@ def read_copilot(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
                     quality.warn("Invalid usage records", path, line, "invalid Copilot token usage; skipped")
                     continue
                 response_id = str(data.get("apiCallId") or key)
-                if any(r.key == response_id for t in thread.turns.values() for r in t.modern):
+                if response_id in seen_responses:
                     quality.counts["Duplicate usage records excluded"] += 1
                     continue
+                seen_responses.add(response_id)
                 turn.modern.append(UsageEvent(at, usage, data.get("model") or model, response_id))
                 ttft = milliseconds(data.get("timeToFirstTokenMs"))
                 if turn.ttft is None:
@@ -891,7 +909,7 @@ def read_copilot(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
             turn = thread.turns.setdefault(key, Turn(key, model=name))
             turn.modern.append(UsageEvent(at, usage, name, key, aggregate=True))
             quality.counts["Copilot aggregate snapshots (dated at shutdown)"] += 1
-        if not detailed:
+        if not matching:
             add_billing(thread, at, "Copilot nano-AIU", metric.get("totalNanoAiu"))
             requests = metric.get("requests", {})
             if isinstance(requests, dict):
@@ -1222,23 +1240,23 @@ def add_thread(windows: list[Window], thread: Thread,
             usage_total = record.usage.total
             name = report_model(model, record.mode, long_context)
             record_windows = targets(model, record.mode, model_tier(model), long_context, [record.at])
-            # Trend points retain tokens and samples; only reporting windows need costs.
+            # Trend points retain tokens, costs, and samples; category detail is for reporting windows.
             costs, unpriced = (price_usage(model, record.usage, record.mode, catalog, aggregate=record.aggregate)
-                               if any(w.granularity is None for w in record_windows) else ({}, {}))
+                               if record_windows else ({}, {}))
             for window in record_windows:
                 if usage_total:
                     window.conversations.add(thread.id)
                 for category, count in counts.items():
                     window.tokens[category] += count
+                for category, cost in costs.items():
+                    window.costs[category] += cost
+                if unpriced:
+                    window.unpriced[name] += sum(unpriced.values())
                 if window.granularity is not None:
                     continue
                 window.models[name] += usage_total
-                for category, cost in costs.items():
-                    window.costs[category] += cost
                 for category, count in unpriced.items():
                     window.unpriced_categories[category] += count
-                if unpriced:
-                    window.unpriced[name] += sum(unpriced.values())
                 window.coverage["Usage responses"] += 1
                 if record.aggregate:
                     window.coverage["Aggregate snapshots"] += 1
@@ -1320,7 +1338,8 @@ def metric_summary(window: Window) -> dict[str, dict[str, int | float | None]]:
 def trend_summary(window: Window) -> dict[str, Any] | None:
     if not window.conversations:
         return None
-    return {**metric_summary(window), "total_tokens": sum(window.tokens.values())}
+    return {**metric_summary(window), "total_tokens": sum(window.tokens.values()),
+            "cost": str(sum(window.costs.values(), Decimal(0))), "partial_cost": bool(window.unpriced)}
 
 
 def summarize(window: Window, report_zone: tzinfo = TIMEZONE) -> dict[str, Any]:
@@ -1415,7 +1434,7 @@ def summarize_breakdown(breakdown: Breakdown, report_zone: tzinfo = TIMEZONE) ->
 def session_identity(path: Path, harness: Harness) -> str:
     identifier = str(path)
     try:
-        with path.open(encoding="utf-8") as stream:
+        with path.open(encoding="utf-8", errors="replace") as stream:
             for line in stream:
                 if not line.strip():
                     continue
@@ -1440,8 +1459,15 @@ def session_identity(path: Path, harness: Harness) -> str:
     return str(identifier)
 
 
+# Parsed groups committed per checkpoint when a failed report should keep imported work.
+CHECKPOINT_GROUPS = 250
+
 # Bump when the schema or parser semantics change; cached facts must match the readers.
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+
+# Children precede parents so older caches can be dropped with foreign keys enabled.
+CACHE_TABLES = ("cache_billing", "cache_calls", "cache_usage", "cache_turns", "cache_threads",
+                "cache_groups", "cache_files")
 
 
 def file_stamp(path: Path) -> str:
@@ -1449,17 +1475,33 @@ def file_stamp(path: Path) -> str:
     return json.dumps([stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns])
 
 
+def cache_tables(connection: sqlite3.Connection) -> set[str]:
+    return {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
 def validate_metrics_cache(connection: sqlite3.Connection, *, allow_empty: bool = False) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    required = {"cache_files", "cache_groups", "cache_threads", "cache_turns", "cache_usage",
-                "cache_calls", "cache_billing"}
-    if version not in (0, CACHE_VERSION):
-        raise ValueError("unsupported metrics cache version; use a new --cache path")
+    tables = cache_tables(connection)
     if not tables and version == 0 and allow_empty:
         return
-    if version != CACHE_VERSION or not required.issubset(tables):
+    if version == 0 or not set(CACHE_TABLES).issubset(tables):
         raise ValueError("cache path contains a different database; choose a separate --cache path")
+    if version < CACHE_VERSION:
+        raise ValueError("metrics cache was built by an older parser; refresh it before reading")
+    if version != CACHE_VERSION:
+        raise ValueError("unsupported metrics cache version; use a new --cache path")
+
+
+def reset_outdated_cache(connection: sqlite3.Connection) -> None:
+    """Drop facts parsed under older reader semantics so sources are parsed again."""
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    tables = cache_tables(connection)
+    # Only a cache made of this tool's tables is dropped; anything else is left untouched.
+    if not 0 < version < CACHE_VERSION or not tables or not tables.issubset(CACHE_TABLES):
+        return
+    for table in CACHE_TABLES:
+        connection.execute(f"DROP TABLE IF EXISTS {table}")
+    connection.execute("PRAGMA user_version=0")
 
 
 class MetricsReader:
@@ -1491,7 +1533,8 @@ class MetricsReader:
             loaded = self.load(key, manifest, quality)
             if loaded is None:
                 raise ValueError("metrics cache changed while reading; refresh and retry")
-            yield from loaded
+            # One OpenCode group can hold T3-attributed threads alongside OpenCode ones.
+            yield from (thread for thread in loaded if harness is None or thread.harness == harness)
 
     def load(self, key: str, manifest: str, quality: Quality) -> list[Thread] | None:
         row = self.connection.execute("SELECT manifest, counts, warnings FROM cache_groups WHERE cache_key=?",
@@ -1532,6 +1575,7 @@ class MetricsCache(MetricsReader):
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
         connection.execute("PRAGMA foreign_keys=ON")
+        reset_outdated_cache(connection)
         validate_metrics_cache(connection, allow_empty=True)
         connection.executescript("""
             CREATE TABLE IF NOT EXISTS cache_files (
@@ -1719,6 +1763,7 @@ class PreparedGroup:
     manifest: str
     uncached: list[Thread] | None = None
     quality: Quality | None = None
+    source: str = ""
 
 
 @dataclass
@@ -1727,12 +1772,23 @@ class PreparedSources:
     files: set[Path]
     first_at: datetime | None
     cache: MetricsCache
-    uncached_groups: int = 0
+    uncached_sources: list[str] = field(default_factory=list)
+
+    @property
+    def uncached_groups(self) -> int:
+        return len(self.uncached_sources)
 
 
 @contextmanager
 def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progress: bool,
-                    cache_path: Path | None, now: datetime) -> Iterator[PreparedSources]:
+                    cache_path: Path | None, now: datetime,
+                    checkpoint: bool = False,
+                    after_commit: Callable[[sqlite3.Connection], None] | None = None) -> Iterator[PreparedSources]:
+    """With checkpoint, parsed groups are committed periodically so a later failure keeps them.
+
+    Without it, every cache update is rolled back if the caller fails (used by the live server).
+    after_commit receives the writer connection once the caller's work has been committed.
+    """
     t3_paths = t3_databases(sources.get(Harness.T3, []))
     if cache_path:
         opencode_paths = sources.get(Harness.OPENCODE, [])
@@ -1765,6 +1821,7 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                 connection.execute("BEGIN")
                 connection.execute("CREATE TEMP TABLE report_groups (cache_key TEXT PRIMARY KEY)")
                 prepared: list[PreparedGroup] = []
+                stored = 0
                 all_paths: set[Path] = set(t3_paths)
                 if t3_paths:
                     key = json.dumps([Harness.T3.value, [str(path) for path in t3_paths]])
@@ -1777,7 +1834,7 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                         prepared.append(PreparedGroup(key, t3_manifest))
                         connection.execute("INSERT INTO report_groups VALUES (?)", (key,))
                     else:
-                        prepared.append(PreparedGroup(key, t3_manifest, [], t3_quality))
+                        prepared.append(PreparedGroup(key, t3_manifest, [], t3_quality, str(t3_paths[0])))
                 readers = {Harness.CODEX: read_thread, Harness.CLAUDE: read_claude, Harness.COPILOT: read_copilot}
                 for harness, directories in scan_sources.items():
                     def attributed_harness(identifier: str) -> Harness:
@@ -1836,8 +1893,12 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                                     pass
                             if stable:
                                 cache.store(key, manifest, loaded, group_quality)
+                                stored += 1
+                                if checkpoint and stored % CHECKPOINT_GROUPS == 0:
+                                    connection.commit()
+                                    connection.execute("BEGIN")
                             else:
-                                group.uncached, group.quality = loaded, group_quality
+                                group.uncached, group.quality, group.source = loaded, group_quality, str(files[0])
                         prepared.append(group)
                         if group.uncached is None:
                             connection.execute("INSERT INTO report_groups VALUES (?)", (key,))
@@ -1865,7 +1926,9 @@ def prepare_sources(sources: dict[Harness, list[Path]], quality: Quality, progre
                             yield from loaded
 
                 yield PreparedSources(threads(), all_paths, first, cache,
-                                      sum(group.uncached is not None for group in prepared))
+                                      [group.source for group in prepared if group.uncached is not None])
+            if after_commit is not None:
+                after_commit(connection)
 
 
 def collect_report(root: Path, now: datetime | None = None, progress: bool = False,
@@ -1884,7 +1947,7 @@ def collect_report(root: Path, now: datetime | None = None, progress: bool = Fal
     if include_codex:
         sources[Harness.CODEX] = list(dict.fromkeys(p.resolve() for p in (root, *additional_roots)))
     roots = list(dict.fromkeys(p for paths in sources.values() for p in paths))
-    with prepare_sources(sources, quality, progress, cache_path, now) as prepared:
+    with prepare_sources(sources, quality, progress, cache_path, now, checkpoint=True) as prepared:
         windows = make_windows(now, report_zone) + make_trend_windows(now, report_zone, prepared.first_at)
         lookup = WindowLookup(windows)
         overall = empty_breakdown(windows)
@@ -1972,9 +2035,8 @@ def default_cache_path() -> Path:
 
 
 def source_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> dict[Harness, list[Path]]:
-    root = args.directory if args.directory is not None else Path.cwd()
-    if not root.is_dir():
-        parser.error(f"not a directory: {root}")
+    if args.directory is not None and not args.directory.is_dir():
+        parser.error(f"not a directory: {args.directory}")
     selected = {Harness(name) for name in args.harness} if args.harness else set(Harness)
     home = Path.home()
     defaults = {harness: paths[0] for harness, paths in native_source_defaults().items()}
@@ -2001,9 +2063,13 @@ def source_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> d
         if existing:
             harness_roots[harness] = existing
     if Harness.CODEX in selected:
-        codex_roots = [home / ".codex" / name for name in ("sessions", "archived_sessions")]
-        harness_roots[Harness.CODEX] = [root] + ([path for path in codex_roots if path.is_dir()]
-                                               if args.directory is None else [])
+        if args.directory is not None:
+            codex_roots = [args.directory]
+        else:
+            codex_roots = [path for path in (home / ".codex" / name for name in ("sessions", "archived_sessions"))
+                           if path.is_dir()]
+        if codex_roots:
+            harness_roots[Harness.CODEX] = codex_roots
     return harness_roots
 
 
@@ -2029,7 +2095,8 @@ def load_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) -> t
                 catalog = openrouter_prices(json.load(response))
             catalog_metadata = {"source": OPENROUTER_SOURCE, "retrieved": datetime.now(timezone.utc).isoformat()}
         except (OSError, ValueError, UnicodeError) as error:
-            print(f"Live OpenRouter prices unavailable: {error}; using bundled prices", file=sys.stderr)
+            fallback = "bundled" if args.openrouter_prices is None else "supplied snapshot"
+            print(f"Live OpenRouter prices unavailable: {error}; using {fallback} prices", file=sys.stderr)
             catalog_metadata["error"] = str(error)
     return catalog, catalog_metadata
 
@@ -2040,13 +2107,14 @@ def main() -> int:
     if args.offline and args.live_prices:
         parser.error("--offline cannot be combined with --live-prices")
     sources = source_paths(args, parser)
-    root = args.directory if args.directory is not None else Path.cwd()
+    codex_roots = sources.get(Harness.CODEX, [])
+    root = codex_roots[0] if codex_roots else Path.cwd()
     if args.output.suffix.lower() != ".html":
         parser.error("output must have an .html extension")
     catalog, catalog_metadata = load_catalog(args, parser)
     try:
         report = collect_report(root, progress=True,
-                                additional_roots=sources.get(Harness.CODEX, [])[1:],
+                                additional_roots=codex_roots[1:],
                                 harness_roots={h: paths for h, paths in sources.items() if h != Harness.CODEX},
                                 include_codex=Harness.CODEX in sources,
                                 catalog=catalog, catalog_metadata=catalog_metadata, report_zone=args.timezone,
@@ -2064,57 +2132,127 @@ HTML = r'''<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Coding agents · Conversation metrics</title>
+<title>Coding agents · Usage report</title>
 <style>
-:root{color-scheme:light;--ink:#172a3c;--muted:#62768a;--paper:#f3f6fa;--line:#e1e8f0;--blue:#3975e7;--teal:#159e99;--violet:#8c67db;--orange:#e99b36;--pink:#df7896}
-*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.6 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1280px;margin:auto;padding:44px 32px 56px}h1,h2,h3,p{margin:0}h1{font-size:38px;line-height:1.2;letter-spacing:-1.4px;font-weight:700}h2{font-size:20px;letter-spacing:-.4px}h3{font-size:16px;font-weight:650}.eyebrow{font-size:11px;letter-spacing:2px;font-weight:700;text-transform:uppercase;color:var(--teal);margin-bottom:12px}.header{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-bottom:32px}.subtitle{color:var(--muted);margin-top:10px}.badge{display:inline-flex;align-items:center;gap:7px;border:1px solid #cfdfdb;border-radius:30px;padding:7px 12px;color:#347c6e;background:#eff9f5;font-size:12px;white-space:nowrap}.dot{width:6px;height:6px;border-radius:50%;background:#159e99}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px;flex-wrap:wrap}.tabs{display:flex;gap:4px;padding:5px;background:#e6ecf3;border-radius:12px;flex-wrap:wrap}button{font:inherit;cursor:pointer}.tabs button{border:0;background:none;padding:9px 14px;border-radius:8px;color:var(--muted);font-weight:600;font-size:12px}.tabs button[aria-pressed=true]{background:#fff;color:var(--ink);box-shadow:0 2px 5px #182c3c10}button:focus-visible,a:focus-visible,[tabindex]:focus-visible{outline:3px solid #3975e780;outline-offset:3px}.range{color:var(--muted);font-size:12px}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:28px}.card,.panel{background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:0 3px 14px #24406003}.card{padding:21px 23px;position:relative;overflow:hidden}.card:before{content:"";position:absolute;top:0;left:23px;width:28px;height:3px;background:var(--accent);border-radius:0 0 3px 3px}.card-label{font-size:12px;color:var(--muted);font-weight:600}.card-value{font-size:31px;letter-spacing:-1px;line-height:1.3;margin:9px 0 7px;font-variant-numeric:tabular-nums}.card-note{font-size:11px;color:var(--muted)}.section-head{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:16px}.section-head p{color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;margin-bottom:28px}.panel{padding:23px}.panel-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}.panel p{color:var(--muted);font-size:12px;margin-top:4px}.unit{font-size:10px;background:var(--paper);padding:4px 8px;border-radius:6px;white-space:nowrap;color:var(--muted)}.legend{display:flex;gap:17px;margin-top:15px;flex-wrap:wrap;font-size:11px;color:var(--muted)}.legend span{display:inline-flex;align-items:center;gap:6px}.swatch{width:7px;height:7px;border-radius:2px;display:inline-block}.chart{margin-top:12px}.chart svg{width:100%;height:auto;display:block;overflow:visible}.stats{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px;border-top:1px solid var(--line);padding-top:15px;margin-top:5px}.stat{grid-column:span 3}.stat:nth-child(n+5){grid-column:span 4}.stat span{display:block;color:var(--muted);font-size:10px}.stat strong{font-size:20px;letter-spacing:-.3px;font-weight:600;font-variant-numeric:tabular-nums}.samples{font-size:11px;color:var(--muted);margin-top:10px}.breakdown-body{display:grid;grid-template-columns:190px 1fr;gap:18px;align-items:center;min-height:215px}.breakdown-body svg{width:100%;height:auto}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;color:var(--muted);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}th,td{padding:10px 5px;border-bottom:1px solid var(--line)}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}tfoot td{font-weight:700;border:0}td.label{white-space:nowrap}.notice{padding:12px 15px;background:#fff7e9;border:1px solid #f1dcae;border-radius:10px;color:#8a651f;font-size:12px;margin-bottom:20px}.empty{padding:44px 20px;text-align:center;color:var(--muted);background:var(--paper);border-radius:10px;margin:16px 0}.quality-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:18px}.definition{margin-bottom:12px;font-size:12px;color:var(--muted)}.definition b{color:var(--ink)}details{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}summary{cursor:pointer;font-weight:600;font-size:12px}.sources{font-size:11px;color:var(--muted);margin-top:16px;overflow-wrap:anywhere}.sources a{color:var(--blue)}.footer{display:flex;justify-content:space-between;gap:16px;margin-top:24px;color:var(--muted);font-size:11px}.tooltip{position:fixed;background:#172a3c;color:#fff;padding:8px 12px;border-radius:8px;font-size:12px;pointer-events:none;z-index:10;max-width:280px;box-shadow:0 5px 20px #172a3c30}.warnings{font:11px/1.7 ui-monospace,monospace;overflow-wrap:anywhere;padding-left:20px}noscript{display:block;padding:20px;background:#fff7e9}
-#performance{grid-template-columns:minmax(0,1fr)}
-.trend-stat-controls{border:0;padding:0;margin:0 0 18px}.trend-stat-controls legend{color:var(--muted);font-size:12px;padding:0;margin-bottom:8px}.trend-stat-options{display:flex;gap:18px;flex-wrap:wrap}.trend-stat-options label{display:inline-flex;align-items:center;gap:7px;font-size:12px;cursor:pointer}.trend-stat-options input{accent-color:var(--teal);width:15px;height:15px;margin:0}.trend-stat-options input:focus-visible{outline:3px solid #3975e780;outline-offset:3px}
-.token-totals{margin:14px 0 0;padding-top:10px;border-top:1px solid var(--line);font-size:11px}.token-totals div{display:flex;justify-content:space-between;gap:12px;margin-top:4px}.token-totals dt{color:var(--muted)}.token-totals dd{margin:0;font-weight:600;font-variant-numeric:tabular-nums}
-.filters{display:flex;gap:16px;flex-wrap:wrap}.model-filter{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px}.model-filter select,.model-filter input{font:inherit;font-weight:600;color:var(--ink);background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px;max-width:100%}.model-filter select{padding-right:34px}.model-filter select:focus-visible,.model-filter input:focus-visible{outline:3px solid #3975e780;outline-offset:3px}.range-error{color:#a33232;margin:-8px 0 16px}.model-comparison{margin-bottom:28px}.comparison-controls{align-items:center;flex-wrap:wrap}.model-comparison table{min-width:800px;margin:16px 0 10px}.model-comparison th,.model-comparison td{white-space:nowrap;padding:13px 10px}.model-comparison td:first-child{font-weight:600}.model-comparison th:first-child,.model-comparison td:first-child{position:sticky;left:0;background:#fff}.model-comparison tr[data-selected=true],.model-comparison tr[data-selected=true] td:first-child{background:#f1f5fd}.filter-scope{color:var(--muted);font-size:12px;margin:-6px 0 18px}
-@media(max-width:900px){main{padding:28px 20px}.cards{grid-template-columns:repeat(2,1fr)}.breakdown-body{grid-template-columns:140px 1fr;gap:10px}.card-value{font-size:28px}}
-@media(max-width:650px){h1{font-size:30px}.header{align-items:flex-start;gap:12px}.badge{font-size:10px;padding:5px 8px}.grid,.quality-grid{grid-template-columns:1fr}.cards{gap:10px}.card{padding:18px 16px}.card-value{font-size:25px}.section-head{display:block}.section-head p{margin-top:4px}.panel{padding:18px}.tabs button{padding:8px 10px;font-size:11px}.breakdown-body{grid-template-columns:130px 1fr}.footer{flex-direction:column;gap:3px}}
-@media print{body{background:#fff}main{padding:0}.tabs,.tooltip{display:none}.panel,.card{break-inside:avoid;box-shadow:none}.grid{gap:10px}.panel{padding:14px}details{display:block}}
+:root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--surface-2:#f2f1ed;--surface-3:#e9e8e3;--ink:#0b0b0b;--ink-2:#52514e;--muted:#6f6e69;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--accent:#2a78d6;--accent-wash:rgba(42,120,214,.10);--focus:rgba(42,120,214,.55);
+--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#4a3aa7;--other:#a9a8a1;--on-s6:#fff;--on-s7:#fff;
+--q0:#f2f1ed;--q1:#cde2fb;--q2:#9ec5f4;--q3:#6da7ec;--q4:#3987e5;--q5:#256abf;--q6:#184f95;--q7:#0d366b;
+--warn-bg:#fff6e0;--warn-ink:#6b4800;--warn-line:#f0d999;--tip-bg:#1d1d1b;--tip-ink:#fff;--tip-muted:#c3c2b7;--shadow:0 1px 2px rgba(11,11,11,.04),0 6px 24px rgba(11,11,11,.05)}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme=light])){color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--surface-2:#242422;--surface-3:#2f2f2c;--ink:#fff;--ink-2:#c3c2b7;--muted:#9a9891;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--accent:#3987e5;--accent-wash:rgba(57,135,229,.14);--focus:rgba(57,135,229,.7);
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--other:#5c5b56;--on-s6:#fff;--on-s7:#0b0b0b;
+--q0:#242422;--q1:#0d366b;--q2:#184f95;--q3:#1c5cab;--q4:#256abf;--q5:#3987e5;--q6:#6da7ec;--q7:#9ec5f4;
+--warn-bg:#2b2410;--warn-ink:#f5d58a;--warn-line:#5a4a1c;--tip-bg:#f2f1ed;--tip-ink:#0b0b0b;--tip-muted:#52514e;--shadow:none}}
+:root[data-theme=dark]{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--surface-2:#242422;--surface-3:#2f2f2c;--ink:#fff;--ink-2:#c3c2b7;--muted:#9a9891;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--accent:#3987e5;--accent-wash:rgba(57,135,229,.14);--focus:rgba(57,135,229,.7);
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--other:#5c5b56;--on-s6:#fff;--on-s7:#0b0b0b;
+--q0:#242422;--q1:#0d366b;--q2:#184f95;--q3:#1c5cab;--q4:#256abf;--q5:#3987e5;--q6:#6da7ec;--q7:#9ec5f4;
+--warn-bg:#2b2410;--warn-ink:#f5d58a;--warn-line:#5a4a1c;--tip-bg:#f2f1ed;--tip-ink:#0b0b0b;--tip-muted:#52514e;--shadow:none}
+*{box-sizing:border-box}html{scroll-padding-top:120px}body{margin:0;background:var(--page);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+h1,h2,h3,p{margin:0}h1{font-size:28px;line-height:1.2;letter-spacing:-.5px;font-weight:650}h2{font-size:18px;letter-spacing:-.2px;font-weight:650}h3{font-size:14px;font-weight:600}
+a{color:var(--accent)}button,select,input{font:inherit;color:inherit}button{cursor:pointer}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+main{max-width:1320px;margin:auto;padding:0 28px 48px}
+.masthead{display:flex;justify-content:space-between;align-items:flex-end;gap:24px;padding:32px 0 20px;flex-wrap:wrap}.eyebrow{font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}.subtitle{color:var(--ink-2);margin-top:6px}
+.head-actions{display:flex;align-items:center;gap:10px}.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:999px;padding:5px 11px;color:var(--ink-2);font-size:12px;background:var(--surface)}.pill i{width:6px;height:6px;border-radius:50%;background:var(--s3)}
+.ghost{border:1px solid var(--border);background:var(--surface);border-radius:8px;padding:6px 11px;font-size:12px;color:var(--ink-2)}.ghost:hover{background:var(--surface-2)}
+.toolbar{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--page) 88%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--border);margin:0 -28px;padding:10px 28px}
+.toolbar-row{display:flex;align-items:center;gap:12px 20px;flex-wrap:wrap}
+.segmented{display:inline-flex;gap:2px;padding:3px;background:var(--surface-2);border:1px solid var(--border);border-radius:10px;flex-wrap:wrap}.segmented button{border:0;background:none;padding:5px 10px;border-radius:7px;color:var(--ink-2);font-size:12.5px;font-weight:550;white-space:nowrap}.segmented button:hover{color:var(--ink)}.segmented button[aria-pressed=true]{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.12)}
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.field{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}.field select,.field input{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12.5px;font-weight:550;color:var(--ink);max-width:220px}
+.field select[data-active=true]{border-color:var(--accent);background:var(--accent-wash)}
+.scope-line{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--muted)}.chip{display:inline-flex;align-items:center;gap:4px;border-radius:999px;background:var(--accent-wash);color:var(--ink);padding:2px 4px 2px 10px;font-size:12px}.chip button{border:0;background:none;color:var(--ink-2);border-radius:50%;width:20px;height:20px;line-height:1;padding:0}.chip button:hover{background:var(--surface-3)}.link-btn{border:0;background:none;color:var(--accent);padding:0;font-size:12px}
+.section{margin-top:36px}.section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px 20px;margin-bottom:14px;flex-wrap:wrap}.section-head p{color:var(--muted);font-size:12.5px;margin-top:3px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);padding:20px;min-width:0}.card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}.card-head p{color:var(--muted);font-size:12.5px;margin-top:2px}
+.notice{display:flex;gap:10px;align-items:flex-start;padding:10px 14px;background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:10px;color:var(--warn-ink);font-size:13px;margin-top:16px}.notice b{font-weight:650}
+.kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:20px}.kpi{padding:16px 16px 10px;display:flex;flex-direction:column}.kpi-label{font-size:12.5px;color:var(--ink-2);font-weight:550}.kpi-value{font-size:28px;font-weight:650;letter-spacing:-.6px;line-height:1.15;margin-top:6px}.kpi-note{font-size:12px;color:var(--muted);margin-top:2px;min-height:18px}.kpi .spark{margin-top:auto;padding-top:10px}.kpi-split{margin:10px 0 0;font-size:12px;display:grid;gap:3px}.kpi-split div{display:flex;justify-content:space-between;gap:8px}.kpi-split dt{color:var(--muted)}.kpi-split dd{margin:0;font-variant-numeric:tabular-nums;font-weight:550}
+.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.stack{display:grid;gap:16px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--ink-2);margin-top:12px}.legend span{display:inline-flex;align-items:center;gap:6px}.key{width:10px;height:10px;border-radius:3px;display:inline-block;flex:none}.key.line{height:2px;width:14px;border-radius:2px}
+.chart{margin-top:10px;position:relative;min-height:40px}.chart svg{display:block;overflow:visible}.chart svg text{font-size:11px;fill:var(--muted);font-variant-numeric:tabular-nums}.chart svg:focus-visible{outline:2px solid var(--focus);outline-offset:4px;border-radius:4px}
+.empty{padding:36px 16px;text-align:center;color:var(--muted);background:var(--surface-2);border-radius:10px;font-size:13px}
+.view-toggle{font-size:12px}.data-table{margin-top:12px;max-height:340px;overflow:auto;border:1px solid var(--border);border-radius:10px}
+.headline{display:flex;align-items:baseline;gap:14px;margin-top:10px;flex-wrap:wrap}.headline strong{font-size:24px;font-weight:650;letter-spacing:-.4px}.headline span{font-size:12.5px;color:var(--muted)}
+.dist{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px;margin-top:14px;padding-top:12px;border-top:1px solid var(--grid)}.dist div{min-width:0}.dist dt{font-size:11px;color:var(--muted)}.dist dd{margin:1px 0 0;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.samples{font-size:12px;color:var(--muted);margin-top:8px}
+.stat-chips{display:flex;gap:6px;flex-wrap:wrap}.stat-chips label{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--border);border-radius:999px;padding:4px 11px 4px 9px;font-size:12.5px;cursor:pointer;background:var(--surface);user-select:none}.stat-chips input{position:absolute;opacity:0;width:1px;height:1px}.stat-chips label:has(input:checked){background:var(--surface-2);border-color:var(--axis)}.stat-chips label:has(input:not(:checked)) .key{background:transparent!important;outline:1.5px solid var(--axis);outline-offset:-1.5px}.stat-chips label:has(input:focus-visible){outline:2px solid var(--focus);outline-offset:2px}
+.composition{display:grid;gap:14px;margin-top:16px}.comp-row{display:grid;grid-template-columns:72px 1fr 90px;gap:12px;align-items:center;font-size:12.5px}.comp-row>span:first-child{color:var(--ink-2);font-weight:550}.comp-row>span:last-child{text-align:right;font-weight:650;font-variant-numeric:tabular-nums}.bar100{display:flex;gap:2px;height:30px}.bar100 div{min-width:2px;display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:600;color:#0b0b0b;font-variant-numeric:tabular-nums}.bar100 div:first-child{border-radius:5px 0 0 5px}.bar100 div:last-child{border-radius:0 5px 5px 0}.bar100 div:only-child{border-radius:5px}
+.insight{font-size:13px;color:var(--ink-2);margin-top:14px;padding:10px 12px;background:var(--surface-2);border-radius:8px}
+.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12.5px}th{text-align:left;color:var(--muted);font-size:11.5px;font-weight:600;white-space:nowrap}th,td{padding:8px 10px;border-bottom:1px solid var(--grid)}tbody tr:last-child td{border-bottom:0}td:first-child{white-space:nowrap}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}tfoot td{font-weight:650;border-top:1px solid var(--axis);border-bottom:0}.data-table th{position:sticky;top:0;background:var(--surface)}
+th button{border:0;background:none;padding:0;color:inherit;font:inherit;display:inline-flex;gap:4px;align-items:center}th button:hover{color:var(--ink)}th[aria-sort] button::after{content:"";border:4px solid transparent;margin-left:2px}th[aria-sort=descending] button::after{border-top-color:currentColor;margin-top:4px}th[aria-sort=ascending] button::after{border-bottom-color:currentColor;margin-bottom:4px}
+.compare tbody tr{cursor:pointer}.compare tbody tr:hover td{background:var(--surface-2)}.compare tbody tr[aria-selected=true] td{background:var(--accent-wash)}.compare td:first-child{font-weight:600;white-space:nowrap}.compare td:first-child .key{margin-right:8px;vertical-align:-1px}.databar{display:flex;align-items:center;justify-content:flex-end;gap:8px;min-width:150px}.databar i{display:block;height:8px;border-radius:0 3px 3px 0;flex:none;background:var(--s1)}.databar .track{flex:1;display:flex;justify-content:flex-start;max-width:90px}.dim{color:var(--muted)}
+.heat-legend{display:flex;align-items:center;gap:4px;font-size:11.5px;color:var(--muted);margin-top:10px}.heat-legend i{width:16px;height:10px;border-radius:2px;display:inline-block}
+.meters{display:grid;gap:12px;margin-top:12px}.meter-row{display:grid;grid-template-columns:1fr auto;gap:4px 12px;font-size:12.5px}.meter-row .val{text-align:right;font-variant-numeric:tabular-nums;color:var(--ink-2)}.meter{grid-column:1/-1;height:6px;background:var(--accent-wash);border-radius:3px;overflow:hidden}.meter i{display:block;height:100%;background:var(--accent);border-radius:3px}
+.counts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:14px}.counts div{background:var(--surface-2);border-radius:8px;padding:8px 10px}.counts dt{font-size:11.5px;color:var(--muted)}.counts dd{margin:2px 0 0;font-weight:650;font-size:16px}
+.defs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 24px;margin-top:8px}.defs details{border-bottom:1px solid var(--grid);padding:10px 0}.defs summary{font-weight:600;font-size:13px;cursor:pointer}.defs details p{color:var(--ink-2);font-size:12.5px;margin-top:6px;line-height:1.6}
+details.more{margin-top:12px;border-top:1px solid var(--grid);padding-top:10px}details.more>summary{cursor:pointer;font-weight:600;font-size:13px}
+.sources{font-size:12px;color:var(--muted);margin-top:16px;overflow-wrap:anywhere;line-height:1.6}.warnings{font:11px/1.7 ui-monospace,monospace;overflow-wrap:anywhere;padding-left:18px;color:var(--ink-2)}
+.footer{display:flex;justify-content:space-between;gap:16px;margin-top:32px;color:var(--muted);font-size:12px;flex-wrap:wrap}
+.range-error{color:#c03030;font-size:12.5px;margin-top:8px}
+.tooltip{position:fixed;z-index:20;background:var(--tip-bg);color:var(--tip-ink);padding:8px 10px;border-radius:8px;font-size:12px;pointer-events:none;min-width:150px;max-width:300px;box-shadow:0 8px 28px rgba(0,0,0,.22)}.tooltip .tip-title{font-weight:600;margin-bottom:4px;color:var(--tip-muted)}.tooltip .tip-row{display:grid;grid-template-columns:14px auto 1fr;gap:8px;align-items:center;line-height:1.7}.tooltip .tip-row strong{font-variant-numeric:tabular-nums;font-weight:650}.tooltip .tip-row span:last-child{color:var(--tip-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tooltip .tip-row .key.line{width:12px}.tooltip .tip-foot{color:var(--tip-muted);margin-top:4px;border-top:1px solid rgba(128,128,128,.3);padding-top:4px}
+noscript{display:block;padding:20px;background:var(--warn-bg)}
+@media(max-width:1100px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:900px){.grid-2,.defs{grid-template-columns:1fr}main{padding:0 18px 40px}.toolbar{margin:0 -18px;padding:10px 18px}}
+@media(max-width:640px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{position:static}.dist{grid-template-columns:repeat(4,minmax(0,1fr));row-gap:8px}h1{font-size:24px}.kpi-value{font-size:24px}.comp-row{grid-template-columns:56px 1fr 72px}}
+@media print{.toolbar{position:static;backdrop-filter:none}.tooltip,.view-toggle,#theme-toggle{display:none}.card{break-inside:avoid;box-shadow:none}details{display:block}}
+@media (forced-colors:active){.key,.bar100 div,.databar i,.meter i{forced-color-adjust:none}}
 </style>
 </head>
 <body><main>
-<header class="header"><div><div class="eyebrow">Coding agents / Usage observatory</div><h1>Conversation metrics</h1><p class="subtitle" id="subtitle"></p></div><div class="badge"><span class="dot"></span>Offline report</div></header>
+<header class="masthead"><div><div class="eyebrow">Coding agents · Usage report</div><h1>Conversation metrics</h1><p class="subtitle" id="subtitle"></p></div><div class="head-actions"><span class="pill"><i></i>Offline report</span><button type="button" class="ghost" id="theme-toggle" aria-label="Color theme">Theme: System</button></div></header>
 <noscript>This report requires JavaScript to display its embedded data and charts. No internet connection is needed.</noscript>
-<div class="toolbar"><nav class="tabs" aria-label="Reporting window" id="tabs"></nav><div class="filters"><label class="model-filter" for="harness-select">Harness <select id="harness-select"><option value="">All harnesses</option></select></label><label class="model-filter" for="tier-select">Tier <select id="tier-select"><option value="">All tiers</option></select></label><label class="model-filter" for="model-select">Model <select id="model-select"><option value="">All models</option></select></label><label class="model-filter" for="mode-select">Mode <select id="mode-select"><option value="">All modes</option></select></label></div></div>
-<p class="filter-scope"><span id="model-scope">All models</span> · <span class="range" id="range"></span></p>
-<div class="notice" id="notice" hidden></div>
-<section class="cards" id="cards" aria-label="Selected window summary" aria-live="polite"></section>
-<div class="section-head comparison-controls"><div><h2>Usage &amp; performance over time</h2><p id="trend-caption"></p></div><div class="filters"><label class="model-filter" for="trend-start">Start <input id="trend-start" type="date" required aria-describedby="trend-range-error"></label><label class="model-filter" for="trend-end">End <input id="trend-end" type="date" required aria-describedby="trend-range-error"></label><label class="model-filter" for="granularity-select">Data points <select id="granularity-select"><option value="hourly">Hourly</option><option value="daily" selected>Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label></div></div>
+<div class="toolbar" role="region" aria-label="Report filters">
+<div class="toolbar-row"><nav class="segmented" aria-label="Reporting window" id="tabs"></nav>
+<div class="filters"><label class="field" for="harness-select">Harness <select id="harness-select"></select></label><label class="field" for="tier-select">Tier <select id="tier-select"></select></label><label class="field" for="model-select">Model <select id="model-select"></select></label><label class="field" for="mode-select">Mode <select id="mode-select"></select></label></div></div>
+<div class="scope-line"><span id="range"></span><span id="scope-chips"></span></div>
+</div>
+<div class="notice" id="notice" role="status" hidden></div>
+<section class="kpis" id="cards" aria-label="Selected window summary" aria-live="polite"></section>
+
+<section class="section" id="trends-section" aria-labelledby="trends-title">
+<div class="section-head"><div><h2 id="trends-title">Usage over time</h2><p id="trend-caption"></p></div>
+<div class="filters"><label class="field" for="trend-start">From <input id="trend-start" type="date" required aria-describedby="trend-range-error"></label><label class="field" for="trend-end">To <input id="trend-end" type="date" required aria-describedby="trend-range-error"></label><label class="field" for="granularity-select">Interval <select id="granularity-select"><option value="hourly">Hourly</option><option value="daily" selected>Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label></div></div>
 <p id="trend-range-error" class="range-error" role="status" hidden></p>
-<section class="panel" id="token-trend" aria-label="Token usage over time" style="margin-bottom:28px"><div class="panel-top"><div><h3>Total tokens over time</h3><p>Input plus output tokens per calendar period · includes cached input and reasoning</p></div><span class="unit">tokens</span></div><div class="chart" id="token-chart"></div></section>
-<fieldset class="trend-stat-controls"><legend>Displayed performance statistics</legend><div class="trend-stat-options" id="trend-stat-options"></div></fieldset>
-<section class="grid" id="performance" aria-label="Performance charts"></section>
-<div class="section-head"><h2>Tokens &amp; estimated cost</h2><p>Selected window · USD · API-equivalent token estimates</p></div>
-<section class="grid" id="breakdowns" aria-label="Token and cost breakdowns"></section>
-<div class="section-head comparison-controls"><div><h2>Compare tiers &amp; models</h2><p>One value per metric · conversations, tokens and costs are totals</p></div><label class="model-filter" for="comparison-stat-select">Metric statistic <select id="comparison-stat-select"></select></label></div>
-<section class="panel model-comparison"><h2>By tier</h2><p id="tier-caption"></p><div class="table-wrap"><table id="tier-comparison"></table></div><p>Select a tier above to explore its charts and costs. Conversations are counted once within each tier and can appear in several tiers.</p></section>
-<section class="panel model-comparison"><h2>By model</h2><p id="comparison-caption"></p><div class="table-wrap"><table id="model-comparison"></table></div><p>Select a model above to explore its charts, cost breakdown, sample counts, and all reporting windows.</p></section>
-<section class="panel"><div class="panel-top"><div><h2>Definitions &amp; data quality</h2><p>Understand the measurements behind the charts.</p></div><span class="unit" id="pricing-date"></span></div>
-<div class="quality-grid"><div>
-<p class="definition"><b>First-token time.</b> Explicit logged time to first token, per completed turn. Missing timings are excluded.</p>
-<p class="definition"><b>Effective throughput.</b> All output tokens, including reasoning, divided by full turn duration. Tool execution and waiting are included.</p>
-<p class="definition"><b>Conversation length.</b> Sum of completed turn durations per thread in the selected window. Idle time between turns is excluded; subagents count separately.</p>
-<p class="definition"><b>Tool calls.</b> Model-issued function, custom-tool, web-search, and tool-search calls. Outputs and mirrored completion events are excluded; nested commands inside a call are not counted separately.</p>
-<p class="definition"><b>Token totals.</b> Total tokens equals input plus output. Input includes cached input and cache writes; output includes reasoning. Cached input counts cache reads and is a subset of input, not an additional token total. The composition chart separates these categories so each token is counted once.</p>
-<p class="definition"><b>Distribution statistics.</b> Average is the arithmetic mean. Median is the middle sample, or the average of the two middle samples for an even count. Minimum and maximum are observed extremes. P75, P95, and P99 use nearest rank. All statistics use the same valid samples; each completed turn receives equal weight for timing and throughput.</p>
-<p class="definition"><b>Trend points.</b> Start and End default to the first recorded activity date and the report cutoff date. Hourly, daily, weekly (Monday start), and monthly points use periods in the report timezone across all available history. Hourly points distinguish repeated daylight saving hours by their UTC offset, and the axis shows time within each selected date. The date controls show periods overlapping the chosen range; weekly and monthly statistics include the whole calendar period. The first and current periods can be partial. Statistics are calculated from each period's samples; conversation duration and calls include activity within that period. Token points show total recorded input plus output tokens per period; periods without recorded usage show zero. Performance statistics do not affect the token line. Missing performance samples appear as gaps. Figures below charts describe the selected reporting window.</p>
-<p class="definition"><b>Window boundaries.</b> Tokens and calls use record time; turn metrics use completion time. Today starts at midnight in the report timezone and ends at the report cutoff. Yesterday is the preceding calendar day in that timezone, excluding today's midnight. Rolling windows are exact 24-hour days. The full duration of a turn finishing in the window is assigned to that window.</p>
-<p class="definition"><b>Model attribution.</b> Fast usage has a separate model entry with a “-fast” suffix. Requests crossing a published context-pricing threshold have a “-long” suffix, including cached input when selecting the threshold; combined usage has “-fast-long”. Usage below the threshold keeps the model name unless Fast. Models without context pricing and aggregate records without per-request sizes do not receive “-long”. Tokens, calls, timing, and costs are separated by recorded mode, with the Fast premium applied to the underlying model's rates. Tokens and calls use their recorded model, falling back to the turn model. Timing uses the model generating that turn. Conversation duration and tool counts include only that model's activity; a thread using multiple models or modes appears in each, so conversation counts are not additive. If several models generate output within one turn, its timing is listed under “Mixed models (timing)”. If one model uses several modes within a turn, its timing is listed under “Mixed modes (timing)” because separate durations cannot be recovered. If one model in one mode crosses context thresholds within a turn, its timing is listed under “Mixed contexts (timing)”. Tool calls follow the context class of matching model and mode usage in their turn; ambiguous calls are listed under “Mixed contexts (tools)”. Mode and tier totals retain this activity once.</p>
-<p class="definition"><b>Model tiers.</b> Budget: Luna, Terra, GPT-5.4-mini, Spark, codex-auto-review, and Claude Haiku. Medium: Sol, GPT-5.4, GPT-5.5, and Claude Sonnet. High: Astra, Claude Opus, Fable, and Mythos. Models outside these groups are Unclassified. Tier metrics are calculated from underlying activity, with each conversation counted once per tier. Turns using several models in the same tier retain their timing in that tier; turns spanning tiers have timing under “Mixed tiers (timing)”. Per-model pricing and the Fast premium still apply. The model selector and comparison table show entries with recorded tokens in the selected window, harness, tier, and mode. Zero-token entries, including shared timing and tool-call buckets, remain included in aggregate totals and coverage.</p>
-<p class="definition"><b>Mode attribution.</b> Logged service tier “default” is Normal; “priority” or “fast” is Fast. Settings persist until changed. Per the selected assumption, unknown mode—including missing evidence, explicit null, and “auto”—is counted as Normal in all metrics and costs. Other explicit tiers have their own bucket. Tokens and calls follow their recorded tier or the latest logged settings. This combines logged mode with the Normal assumption; a backend fallback cannot be detected without a response tier. A turn with usage in several modes has its timing under “Mixed modes (timing)” because separate durations are unavailable. Conversation durations and calls include only activity attributed to the selected mode.</p>
-<p class="definition"><b>Harness coverage.</b> Claude Code reads project JSONL files, Copilot reads CLI session events, and OpenCode reads its message and tool tables. T3 Code links saved native sessions to the Codex, Claude Code, and OpenCode readers; linked sessions count once under T3 when selected. Missing native logs and other T3 providers are outside coverage. Copilot shutdown-only totals are assigned to shutdown, which does not establish when individual requests occurred. Timing samples require logged timing evidence.</p>
-<p class="definition"><b>Coverage.</b> Logs in the listed input directories include archived and active sessions. Copies sharing a conversation ID are merged; repeated usage responses, tool calls, and turn completions are counted once. Active logs are read while they may still be growing; the report cutoff limits included activity. Unfinished turns contribute recorded tokens and calls, with completion timings excluded. An older-window label does not imply a complete year of available history. Missing durations are excluded, so conversation duration can be partial.</p>
-<p class="definition"><b>Cost estimate.</b> Current standard API rates are applied to every historical window, with an assumed 50% premium on OpenAI token categories recorded in Fast mode. Normal, including assumed Normal activity, uses base rates. Other explicit tiers also use base rates; their actual premiums are unknown. Codex 5.3 Spark uses GPT-5.4-mini rates and codex-auto-review uses GPT-5.6-luna rates as user-selected proxies, not published prices for those models. These are API-equivalent estimates, not subscription bills. Claude cache writes include separate 5-minute and 1-hour rates when logged; Claude Fast uses its published model-specific premium. Unpublished Fast rates remain unpriced. OpenRouter catalog rates price matched models lacking an embedded rate table. OpenCode input/cache and output/reasoning counters are normalized to avoid overlap. Recorded harness costs and billing units are shown separately below. Subscription charges, tool fees, and regional uplifts are excluded. Reasoning is split out of output; cache reads/writes are split out of input. OpenAI long-context rates apply above 272,000 input tokens where published. Older Claude Sonnet rates change above 200,000; Claude 4.6+ uses standard rates throughout its context window. OpenRouter context thresholds come from the catalog. Aggregate counters without per-request sizes assume normal-context rates, including the base OpenRouter rates without context overrides. Recorded speed-mode premiums still apply where known; actual long-context costs may be higher.</p>
-</div><div><h3>Selected-window coverage</h3><div class="table-wrap"><table id="coverage"></table></div><h3 style="margin-top:18px">Unpriced usage</h3><div id="unpriced"></div></div></div>
-<details><summary>Token usage by model</summary><div class="table-wrap"><table id="models"></table></div></details>
-<details><summary>Parser diagnostics</summary><div class="table-wrap"><table id="diagnostics"></table></div><ul class="warnings" id="warnings"></ul></details>
-<details><summary>Exact metrics for every window</summary><div class="table-wrap"><table id="all-metrics"></table></div></details>
-<h3 style="margin-top:18px">Recorded costs &amp; billing units</h3><p>Harness totals for the selected window; tier, model, and mode filters do not apply. Recorded USD, credits, and request counters are separate from the API estimate above.</p><div class="table-wrap"><table id="recorded-billing"></table></div><h3 style="margin-top:18px">Matched OpenRouter prices</h3><p>Base catalog rates in USD per million tokens; context overrides are applied per request in estimated costs.</p><div class="table-wrap"><table id="router-prices"></table></div><p class="sources" id="sources"></p>
+<div class="stack">
+<article class="card" id="usage-card"><div class="card-head"><div><h3 id="usage-title">Tokens per day</h3><p id="usage-desc"></p></div><div class="filters"><div class="segmented" id="usage-metric" aria-label="Measure"></div><label class="field" for="split-select">Split by <select id="split-select"><option value="none">Nothing</option><option value="model">Model</option><option value="harness">Harness</option><option value="tier">Tier</option><option value="mode">Mode</option></select></label></div></div>
+<div class="legend" id="usage-legend"></div><div class="chart" id="usage-chart"></div><div id="usage-table"></div></article>
+<article class="card" id="heat-card"><div class="card-head"><div><h3>When you work</h3><p id="heat-desc"></p></div></div><div class="chart" id="heat-chart"></div><div class="heat-legend" id="heat-legend"></div><div id="heat-table"></div></article>
+</div></section>
+
+<section class="section" id="performance-section" aria-labelledby="performance-title">
+<div class="section-head"><div><h2 id="performance-title">Responsiveness &amp; workload</h2><p>Lines show the selected statistics per period over the same date range · figures below each chart describe the selected window</p></div>
+<fieldset class="stat-chips" id="trend-stat-options" style="border:0;padding:0;margin:0"><legend class="field" style="float:left;margin-right:6px;padding-top:5px">Show</legend></fieldset></div>
+<div class="grid-2" id="performance"></div></section>
+
+<section class="section" id="cost-section" aria-labelledby="cost-title">
+<div class="section-head"><div><h2 id="cost-title">Where tokens and dollars go</h2><p>Selected window · each token is counted once · USD API-equivalent estimates</p></div></div>
+<article class="card" id="composition"></article></section>
+
+<section class="section" id="compare-section" aria-labelledby="compare-title">
+<div class="section-head"><div><h2 id="compare-title">Compare</h2><p id="comparison-caption"></p></div><div class="filters"><div class="segmented" id="compare-dimension" aria-label="Compare by"></div><label class="field" for="comparison-stat-select">Statistic <select id="comparison-stat-select"></select></label></div></div>
+<article class="card"><div class="table-wrap"><table class="compare" id="comparison"></table></div><p class="samples" id="comparison-note"></p></article></section>
+
+<section class="section" id="quality-section" aria-labelledby="quality-title">
+<div class="section-head"><div><h2 id="quality-title">Data quality &amp; methodology</h2><p>How complete the selected window is, and how each measurement is defined.</p></div><span class="pill" id="pricing-date"></span></div>
+<div class="grid-2"><article class="card"><h3>Sample coverage</h3><p class="samples" style="margin-top:2px">Share of completed turns with each timing signal in the selected window</p><div class="meters" id="coverage-meters"></div><dl class="counts" id="coverage-counts"></dl>
+<details class="more"><summary>All coverage counts</summary><div class="table-wrap"><table id="coverage"></table></div></details></article>
+<article class="card"><h3>Pricing coverage</h3><div id="unpriced"></div><h3 style="margin-top:16px">Recorded costs &amp; billing units</h3><p class="samples" style="margin-top:2px">Harness totals for the selected window; tier, model, and mode filters do not apply. Recorded USD, credits, and request counters are separate from the API estimate above.</p><div class="table-wrap"><table id="recorded-billing"></table></div>
+<details class="more"><summary>Matched OpenRouter prices</summary><p class="samples">Base catalog rates in USD per million tokens; context overrides are applied per request in estimated costs.</p><div class="table-wrap"><table id="router-prices"></table></div></details>
+<details class="more"><summary>Parser diagnostics</summary><div class="table-wrap"><table id="diagnostics"></table></div><ul class="warnings" id="warnings"></ul></details></article></div>
+<article class="card" style="margin-top:16px"><div class="card-head"><div><h3>Definitions</h3><p>Expand a topic to see exactly how it is measured.</p></div><button type="button" class="ghost" id="expand-defs">Expand all</button></div><div class="defs" id="definitions">
+<details><summary>First-token time</summary><p>Explicit logged time to first token, per completed turn. Missing timings are excluded.</p></details>
+<details><summary>Effective throughput</summary><p>All output tokens, including reasoning, divided by full turn duration. Tool execution and waiting are included.</p></details>
+<details><summary>Conversation length</summary><p>Sum of completed turn durations per thread in the selected window. Idle time between turns is excluded; subagents count separately.</p></details>
+<details><summary>Tool calls</summary><p>Model-issued function, custom-tool, web-search, and tool-search calls. Outputs and mirrored completion events are excluded; nested commands inside a call are not counted separately.</p></details>
+<details><summary>Token totals</summary><p>Total tokens equals input plus output. Input includes cached input and cache writes; output includes reasoning. Cached input counts cache reads and is a subset of input, not an additional token total. The composition chart separates these categories so each token is counted once.</p></details>
+<details><summary>Distribution statistics</summary><p>Average is the arithmetic mean. Median is the middle sample, or the average of the two middle samples for an even count. Minimum and maximum are observed extremes. P75, P95, and P99 use nearest rank. All statistics use the same valid samples; each completed turn receives equal weight for timing and throughput.</p></details>
+<details><summary>Trend points</summary><p>From and To default to the first recorded activity date and the report cutoff date. Hourly, daily, weekly (Monday start), and monthly points use periods in the report timezone across all available history. Hourly points distinguish repeated daylight saving hours by their UTC offset. The date controls show periods overlapping the chosen range; weekly and monthly statistics include the whole calendar period. The first and current periods can be partial. Statistics are calculated from each period's samples; conversation duration and calls include activity within that period. Token and cost points show recorded usage per period; periods without recorded usage show zero. Performance statistics do not affect the usage chart. Missing performance samples appear as gaps. The activity heatmap sums hourly tokens by weekday and hour of the report timezone across the chosen range. Summary sparklines use hourly points for Today and Yesterday and daily points overlapping other windows. Figures below charts describe the selected reporting window.</p></details>
+<details><summary>Window boundaries</summary><p>Tokens and calls use record time; turn metrics use completion time. Today starts at midnight in the report timezone and ends at the report cutoff. Yesterday is the preceding calendar day in that timezone, excluding today's midnight. Rolling windows are exact 24-hour days. The full duration of a turn finishing in the window is assigned to that window.</p></details>
+<details><summary>Model attribution</summary><p>Fast usage has a separate model entry with a “-fast” suffix. Requests crossing a published context-pricing threshold have a “-long” suffix, including cached input when selecting the threshold; combined usage has “-fast-long”. Usage below the threshold keeps the model name unless Fast. Models without context pricing and aggregate records without per-request sizes do not receive “-long”. Tokens, calls, timing, and costs are separated by recorded mode, with the Fast premium applied to the underlying model's rates. Tokens and calls use their recorded model, falling back to the turn model. Timing uses the model generating that turn. Conversation duration and tool counts include only that model's activity; a thread using multiple models or modes appears in each, so conversation counts are not additive. If several models generate output within one turn, its timing is listed under “Mixed models (timing)”. If one model uses several modes within a turn, its timing is listed under “Mixed modes (timing)” because separate durations cannot be recovered. If one model in one mode crosses context thresholds within a turn, its timing is listed under “Mixed contexts (timing)”. Tool calls follow the context class of matching model and mode usage in their turn; ambiguous calls are listed under “Mixed contexts (tools)”. Mode and tier totals retain this activity once. When the usage chart is split by model, models beyond the seven with the most tokens across the report share the “Other” color, and are combined when several appear together.</p></details>
+<details><summary>Model tiers</summary><p>Budget: Luna, Terra, GPT mini and nano models, Spark, codex-auto-review, and Claude Haiku. Medium: Sol, GPT-5.4, GPT-5.5, and Claude Sonnet. High: Astra, Claude Opus, Fable, and Mythos. Models outside these groups are Unclassified. Tier metrics are calculated from underlying activity, with each conversation counted once per tier. Turns using several models in the same tier retain their timing in that tier; turns spanning tiers have timing under “Mixed tiers (timing)”. Per-model pricing and the Fast premium still apply. The model selector and comparison table show entries with recorded tokens in the selected window, harness, tier, and mode. Zero-token entries, including shared timing and tool-call buckets, remain included in aggregate totals and coverage.</p></details>
+<details><summary>Mode attribution</summary><p>Logged service tier “default” is Normal; “priority” or “fast” is Fast. Settings persist until changed. Per the selected assumption, unknown mode—including missing evidence, explicit null, and “auto”—is counted as Normal in all metrics and costs. Other explicit tiers have their own bucket. Tokens and calls follow their recorded tier or the latest logged settings. This combines logged mode with the Normal assumption; a backend fallback cannot be detected without a response tier. A turn with usage in several modes has its timing under “Mixed modes (timing)” because separate durations are unavailable. Conversation durations and calls include only activity attributed to the selected mode.</p></details>
+<details><summary>Harness coverage</summary><p>Claude Code reads project JSONL files, Copilot reads CLI session events, and OpenCode reads its message and tool tables. T3 Code links saved native sessions to the Codex, Claude Code, and OpenCode readers; linked sessions count once under T3 when selected. Missing native logs and other T3 providers are outside coverage. Copilot shutdown-only totals are assigned to shutdown, which does not establish when individual requests occurred. Timing samples require logged timing evidence.</p></details>
+<details><summary>Coverage</summary><p>Logs in the listed input directories include archived and active sessions. Copies sharing a conversation ID are merged; repeated usage responses, tool calls, and turn completions are counted once. Active logs are read while they may still be growing; the report cutoff limits included activity. Unfinished turns contribute recorded tokens and calls, with completion timings excluded. An older-window label does not imply a complete year of available history. Missing durations are excluded, so conversation duration can be partial.</p></details>
+<details><summary>Cost estimate</summary><p>Current standard API rates are applied to every historical window, with an assumed 50% premium on OpenAI token categories recorded in Fast mode. Normal, including assumed Normal activity, uses base rates. Other explicit tiers also use base rates; their actual premiums are unknown. Codex 5.3 Spark uses GPT-5.4-mini rates and codex-auto-review uses GPT-5.6-luna rates as user-selected proxies, not published prices for those models. These are API-equivalent estimates, not subscription bills. Claude cache writes include separate 5-minute and 1-hour rates when logged; Claude Fast uses its published model-specific premium. Unpublished Fast rates remain unpriced. OpenRouter catalog rates price matched models lacking an embedded rate table. OpenCode input/cache and output/reasoning counters are normalized to avoid overlap. Recorded harness costs and billing units are shown separately. Subscription charges, tool fees, and regional uplifts are excluded. Reasoning is split out of output; cache reads/writes are split out of input. OpenAI long-context rates apply above 272,000 input tokens where published. Older Claude Sonnet rates change above 200,000; Claude 4.6+ uses standard rates throughout its context window. OpenRouter context thresholds come from the catalog. Aggregate counters without per-request sizes assume normal-context rates, including the base OpenRouter rates without context overrides. Recorded speed-mode premiums still apply where known; actual long-context costs may be higher. Blended cost per million tokens divides a category's estimated cost by its priced and unpriced tokens.</p></details>
+</div>
+<details class="more"><summary>Exact metrics for every window</summary><div class="table-wrap"><table id="all-metrics"></table></div></details>
+<p class="sources" id="sources"></p></article>
 </section>
 <footer class="footer"><span id="footer"></span><span>Generated locally · No conversation content embedded</span></footer>
 </main><div class="tooltip" id="tooltip" role="tooltip" hidden></div>
@@ -2122,127 +2260,438 @@ HTML = r'''<!doctype html>
 <script>
 'use strict';
 const data=JSON.parse(document.getElementById('report-data').textContent);
-const colors=['#3975e7','#159e99','#8c67db','#e99b36','#df7896'];
-const metricDefs=[['ttft','Time to first token','seconds','Explicit first-token timing per completed turn'],['throughput','Effective throughput','tokens / second','Output tokens over full turn duration'],['length','Conversation length','minutes','Active duration per conversation'],['tools','Tool calls','calls / conversation','Model-issued calls per conversation']];
-const chartStats=[['avg','Average',colors[0]],['median','Median',colors[3]],['p75','P75',colors[4]],['p95','P95',colors[1]],['p99','P99',colors[2]]];
-const selectedChartStats=new Set(['p95']);
-const visibleChartStats=()=>chartStats.filter(([stat])=>selectedChartStats.has(stat));
-const statDefs=[['avg','Average'],['p75','P75'],['p95','P95'],['p99','P99'],['min','Minimum'],['median','Median'],['max','Maximum']];
-let selected=0,selectedModel='',selectedMode='',selectedTier='',selectedHarness='',selectedStatistic='avg',selectedGranularity='daily';
+const $=id=>document.getElementById(id);
+const SLOTS=7;
+const metricDefs=[
+    {key:'ttft',title:'Time to first token',short:'First token',unit:'s',desc:'Explicit first-token timing per completed turn',sample:'turn',chart:v=>v,axis:v=>`${trim(v)}s`,format:v=>seconds(v)},
+    {key:'throughput',title:'Effective throughput',short:'Throughput',unit:'tok/s',desc:'Output tokens over full turn duration',sample:'turn',chart:v=>v,axis:v=>compact(v),format:v=>`${v>=1000?compact(v):number(v,v>=100?0:1)} tok/s`},
+    {key:'length',title:'Conversation length',short:'Length',unit:'min',desc:'Active duration per conversation, idle time excluded',sample:'conversation',chart:v=>v/60,axis:v=>`${trim(v)}m`,format:v=>duration(v)},
+    {key:'tools',title:'Tool calls per conversation',short:'Calls / conv.',unit:'calls',desc:'Model-issued calls per conversation',sample:'conversation',chart:v=>v,axis:v=>trim(v),format:v=>number(v,1)}];
+const chartStats=[['avg','Average','var(--s1)'],['median','Median','var(--s2)'],['p75','P75','var(--s3)'],['p95','P95','var(--s7)'],['p99','P99','var(--s5)']];
+const statDefs=[['median','Median'],['avg','Average'],['p75','P75'],['p95','P95'],['p99','P99'],['min','Minimum'],['max','Maximum']];
+const distOrder=[['min','Min'],['median','Median'],['avg','Avg'],['p75','P75'],['p95','P95'],['p99','P99'],['max','Max']];
 const firstDate=data.trend_periods.daily[0].start.slice(0,10),cutoffDate=data.generated.slice(0,10);
-let trendStart=firstDate,trendEnd=cutoffDate;
-const harnessGroup=()=>selectedHarness?data.by_harness[selectedHarness]:data;
-const activeGroup=()=>selectedTier?harnessGroup().by_tier[selectedTier]:harnessGroup();
-const activeModels=()=>selectedMode?activeGroup().by_mode[selectedMode].by_model:activeGroup().by_model;
-const visibleModels=()=>Object.entries(activeModels()).filter(([,windows])=>windows[selected].total_tokens>0);
-const activeTrends=()=>{const group=selectedMode?activeGroup().by_mode[selectedMode]:activeGroup();return (selectedModel?group.by_model_trends[selectedModel]:group.trends)[selectedGranularity]};
-const activeWindows=()=>selectedModel?activeModels()[selectedModel]:selectedMode?activeGroup().by_mode[selectedMode].windows:activeGroup().windows;
-const $=id=>document.getElementById(id), number=n=>Number(n).toLocaleString('en-US',{maximumFractionDigits:2}), money=n=>Number(n).toLocaleString('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2});
+const state={window:0,harness:'',tier:'',model:'',mode:'',granularity:'daily',start:firstDate,end:cutoffDate,measure:'tokens',split:'none',stats:new Set(['median','p95']),compare:'model',statistic:'median',sort:'cost',dir:-1,usageTable:false,heatTable:false};
+
+// Formatting
+const number=(n,d=2)=>Number(n).toLocaleString('en-US',{maximumFractionDigits:d});
+const integer=n=>Math.round(Number(n)).toLocaleString('en-US');
 const compact=n=>Number(n).toLocaleString('en-US',{notation:'compact',maximumFractionDigits:1});
-const text=(tag,value,cls)=>{const e=document.createElement(tag);e.textContent=value;if(cls)e.className=cls;return e};
+const trim=n=>Number(n).toLocaleString('en-US',{maximumFractionDigits:Math.abs(n)<10?2:1});
+const money=n=>{n=Number(n);return n>0&&n<.005?'<$0.01':n.toLocaleString('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2})};
+const moneyAxis=n=>n>=1000?'$'+compact(n):n>=10?'$'+number(n,0):n>=1||n<=0?'$'+number(n,2):'$'+n.toLocaleString('en-US',{maximumSignificantDigits:2});
+const moneyRate=n=>n.toLocaleString('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:n<1?3:2});
+const percent=(v,total)=>total>0?(v/total*100<1&&v>0?'<1%':`${Math.round(v/total*100)}%`):'—';
+const seconds=v=>v===null||v===undefined?'—':v<10?`${number(v,2)} s`:`${number(v,1)} s`;
+function duration(s){if(s===null||s===undefined)return '—';s=Math.round(s);if(s<60)return `${s}s`;const m=Math.floor(s/60);if(m<60)return `${m}m ${String(s%60).padStart(2,'0')}s`;const h=Math.floor(m/60);return `${number(h,0)}h ${String(m%60).padStart(2,'0')}m`}
+const day=(iso,opts)=>new Date(iso.slice(0,10)+'T00:00:00Z').toLocaleDateString('en-US',{...opts,timeZone:'UTC'});
 const fmtDate=value=>new Date(value).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:data.timezone});
 const fmtTime=value=>new Date(value).toLocaleString('en-US',{dateStyle:'medium',timeStyle:'short',timeZone:data.timezone});
-const displayMetric=(key,value)=>value===null?'N/A':number(key==='length'?value/60:value);
-const comparisonMetric=(key,m)=>displayMetric(key,m[selectedStatistic]);
-const comparisonLabel=()=>statDefs.find(([stat])=>stat===selectedStatistic)[1];
+const hourCounts=new Map();for(const p of data.trend_periods.hourly)hourCounts.set(p.label.slice(0,16),(hourCounts.get(p.label.slice(0,16))||0)+1);
+function periodLabel(period,granularity,long){
+    const label=period.label;
+    if(granularity==='hourly'){const hour=label.slice(11,16),offset=hourCounts.get(label.slice(0,16))>1&&label.slice(16)?` (UTC${label.slice(16)})`:'';return long?`${day(label,{weekday:'short',month:'short',day:'numeric',year:'numeric'})} · ${hour}${offset}`:`${day(label,{month:'short',day:'numeric'})} ${hour}`}
+    if(granularity==='weekly')return long?`Week of ${day(label,{month:'short',day:'numeric',year:'numeric'})}`:day(label,{month:'short',day:'numeric'});
+    if(granularity==='monthly')return day(label,{month:long?'long':'short',year:'numeric'});
+    return long?day(label,{weekday:'short',month:'short',day:'numeric',year:'numeric'}):day(label,{month:'short',day:'numeric'});
+}
+
+// DOM helpers
+const text=(tag,value,cls)=>{const e=document.createElement(tag);if(value!==undefined&&value!==null)e.textContent=value;if(cls)e.className=cls;return e};
 const svgNode=(tag,attrs={},value)=>{const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [key,v] of Object.entries(attrs))e.setAttribute(key,String(v));if(value!==undefined)e.textContent=value;return e};
-function svgBase(label,w,h){const svg=svgNode('svg',{viewBox:`0 0 ${w} ${h}`,role:'img','aria-label':label});svg.append(svgNode('title',{},label));return svg}
-function tip(node,label){node.setAttribute('tabindex','0');node.setAttribute('aria-label',label);node.append(svgNode('title',{},label));const show=(event)=>{const rect=node.getBoundingClientRect();const x=event.clientX||rect.x+rect.width/2,y=event.clientY||rect.y;$('tooltip').textContent=label;$('tooltip').hidden=false;$('tooltip').style.left=`${Math.max(8,Math.min(x+12,window.innerWidth-285))}px`;$('tooltip').style.top=`${Math.max(8,Math.min(y+14,window.innerHeight-80))}px`};node.addEventListener('pointermove',show);node.addEventListener('focus',show);for(const kind of ['pointerleave','blur'])node.addEventListener(kind,()=>$('tooltip').hidden=true)}
-function table(target,headers,rows){target.replaceChildren();const head=document.createElement('thead'),tr=document.createElement('tr');headers.forEach((h,i)=>tr.append(text('th',h,i?'num':'')));head.append(tr);target.append(head);const body=document.createElement('tbody');rows.forEach(row=>{const r=document.createElement('tr');row.forEach((v,i)=>r.append(text('td',v,i?'num':'')));body.append(r)});target.append(body)}
-function metricChart(key,title,unit){
-    const tokens=key==='total_tokens',statistics=tokens?[[key,'Total tokens',colors[1]]]:visibleChartStats();
-    if(!statistics.length)return text('div','Select a statistic above to display the chart.','empty');
-    const active=activeTrends();
-    const firstDay=data.trend_periods.daily.find(p=>p.start.slice(0,10)===trendStart),lastDay=data.trend_periods.daily.find(p=>p.start.slice(0,10)===trendEnd),rangeStart=Date.parse(firstDay.start);
-    const entries=data.trend_periods[selectedGranularity].map((period,index)=>({period,metrics:active[index]})).filter(({period})=>period.start.slice(0,10)<=trendEnd&&(Date.parse(period.end)>rangeStart||Date.parse(period.end)===rangeStart&&!period.end_exclusive));
-    const periods=entries.map(({period})=>period),values=entries.map(({metrics})=>metrics);
-    const maxima=tokens?values.map(v=>v?.total_tokens??0):values.flatMap(v=>v?statistics.map(([stat])=>v[key][stat]):[]).filter(v=>v!==null).map(v=>key==='length'?v/60:v);
-    if(!maxima.length)return text('div','No valid samples in these periods.','empty');
-    const svg=svgBase(`${title}: ${selectedGranularity} ${statistics.map(([,label])=>label).join(', ')} from ${trendStart} to ${trendEnd}`,540,230);
-    const max=maxima.reduce((largest,value)=>Math.max(largest,value),tokens?1:0.001)*1.12,top=18,bottom=190,left=48,right=530;
-    const hourly=selectedGranularity==='hourly',dateNumber=date=>Date.parse(date+'T00:00:00Z');
-    const start=hourly?rangeStart:dateNumber(trendStart);
-    const end=hourly?Date.parse(lastDay.end):dateNumber(trendEnd);
-    const x=date=>end===start?(left+right)/2:left+(right-left)*(date-start)/(end-start);
-    for(let i=0;i<=4;i++){
-        const y=bottom-(bottom-top)*i/4;
-        svg.append(svgNode('line',{x1:left,y1:y,x2:right,y2:y,stroke:'#e9eef4','stroke-dasharray':i?'3 4':'0'}));
-        svg.append(svgNode('text',{x:left-7,y:y+3,'text-anchor':'end',fill:'#8290a1','font-size':10},compact(max*i/4)));
+const key=(color,line)=>{const k=text('i','','key'+(line?' line':''));k.style.background=color;return k};
+function table(target,headers,rows,options={}){
+    target.replaceChildren();const head=document.createElement('thead'),tr=document.createElement('tr');
+    headers.forEach((h,i)=>tr.append(text('th',h,i&&!options.textColumns?.includes(i)?'num':'')));head.append(tr);target.append(head);
+    const body=document.createElement('tbody');
+    rows.forEach(row=>{const r=document.createElement('tr');row.forEach((v,i)=>r.append(v instanceof Node?(()=>{const td=text('td','',i&&!options.textColumns?.includes(i)?'num':'');td.append(v);return td})():text('td',v,i&&!options.textColumns?.includes(i)?'num':'')));body.append(r)});
+    target.append(body);
+    if(options.foot){const foot=document.createElement('tfoot'),r=document.createElement('tr');options.foot.forEach((v,i)=>r.append(text('td',v,i?'num':'')));foot.append(r);target.append(foot)}
+    if(!rows.length){const r=document.createElement('tr'),td=text('td',options.empty||'Nothing recorded.','dim');td.colSpan=headers.length;r.append(td);body.append(r)}
+}
+
+// Tooltip: values lead, labels follow
+const tooltip=$('tooltip');
+function showTip(x,y,title,rows,foot){
+    tooltip.replaceChildren(text('div',title,'tip-title'));
+    for(const row of rows){const r=text('div','','tip-row');r.append(row.color?key(row.color,row.line):text('i'),text('strong',row.value),text('span',row.name));tooltip.append(r)}
+    if(foot)tooltip.append(text('div',foot,'tip-foot'));
+    tooltip.hidden=false;const w=tooltip.offsetWidth,h=tooltip.offsetHeight;
+    tooltip.style.left=`${x+16+w>innerWidth-8?Math.max(8,x-16-w):x+16}px`;tooltip.style.top=`${Math.max(8,Math.min(y-h/2,innerHeight-h-8))}px`;
+}
+const hideTip=()=>{tooltip.hidden=true};
+
+// Charts re-render on resize so text stays at its real size
+const mounted=new Map();
+const resizer=new ResizeObserver(entries=>{for(const entry of entries){const m=mounted.get(entry.target);const width=Math.round(entry.contentRect.width);if(m&&width&&Math.abs(width-m.width)>2){m.width=width;entry.target.replaceChildren(m.draw(width))}}});
+function mount(container,draw){for(const node of mounted.keys())if(!node.isConnected&&node!==container){mounted.delete(node);resizer.unobserve(node)}const width=Math.round(container.clientWidth)||600;mounted.set(container,{draw,width});container.replaceChildren(draw(width));resizer.observe(container)}
+function niceStep(raw){const power=10**Math.floor(Math.log10(raw)),f=raw/power;return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*power}
+function ticks(max,count){if(!(max>0))max=1;const step=niceStep(max/count),top=Math.ceil(max/step-1e-9)*step,result=[];for(let i=0;i*step<=top+step/2;i++)result.push(i*step);return result}
+const roundedTop=(x,y0,y1,w,r)=>r>0?`M${x},${y0}V${y1+r}Q${x},${y1} ${x+r},${y1}H${x+w-r}Q${x+w},${y1} ${x+w},${y1+r}V${y0}Z`:`M${x},${y0}V${y1}H${x+w}V${y0}Z`;
+
+// Time series: stacked columns or lines, index-banded, with a crosshair readout
+function timeChart(o){return width=>{
+    const n=o.periods.length,spark=!!o.spark,height=o.height||(spark?44:240);
+    if(!n||!o.series.length)return text('div',o.empty||'No data in this range.','empty');
+    const sums=o.stacked?o.periods.map((_,i)=>o.series.reduce((t,s)=>t+(s.values[i]||0),0)):null;
+    const all=o.stacked?sums:o.series.flatMap(s=>s.values).filter(v=>v!==null&&v!==undefined);
+    if(!spark&&!all.some(v=>v>0)&&!o.stacked&&!all.length)return text('div',o.empty||'No valid samples in this range.','empty');
+    const max=Math.max(0,...all),yt=ticks(max,spark?1:4),top=spark?max||1:yt[yt.length-1];
+    const labels=yt.map(o.axis||compact),left=spark?1:Math.max(...labels.map(l=>l.length))*6.6+12,right=width-(spark?4:6),y0=spark?4:8,y1=height-(spark?2:24);
+    const band=(right-left)/n,x=i=>left+band*(i+.5),y=v=>y1-(v/top)*(y1-y0);
+    const svg=svgNode('svg',{width,height,viewBox:`0 0 ${width} ${height}`,role:'img','aria-label':o.label});
+    svg.append(svgNode('title',{},o.label));
+    if(!spark){
+        yt.forEach((t,i)=>{svg.append(svgNode('line',{x1:left,x2:right,y1:y(t),y2:y(t),style:`stroke:var(${i?'--grid':'--axis'})`,'shape-rendering':'crispEdges'}),svgNode('text',{x:left-8,y:y(t)+3.5,'text-anchor':'end'},labels[i]))});
+        const count=Math.max(2,Math.min(n,Math.floor((right-left)/(o.granularity==='hourly'?110:84)))),seen=new Set();
+        for(let k=0;k<count;k++){const i=n===1?0:Math.round(k*(n-1)/(count-1));if(seen.has(i))continue;seen.add(i);
+            const anchor=n===1?'middle':k===0&&x(i)-left<30?'start':k===count-1&&right-x(i)<30?'end':'middle';
+            svg.append(svgNode('text',{x:anchor==='start'?Math.max(left,x(i)-band/2):anchor==='end'?Math.min(right,x(i)+band/2):x(i),y:height-6,'text-anchor':anchor},periodLabel(o.periods[i],o.granularity,false)))}
     }
-    for(const [stat,label,color] of statistics){
-        let path='',connected=false;
-        const points=[];
-        values.forEach((metrics,index)=>{
-            const m=tokens?{[stat]:metrics?.total_tokens??0}:metrics?.[key];
-            if(!m||m[stat]===null){connected=false;return}
-            const value=key==='length'?m[stat]/60:m[stat],at=hourly?Date.parse(periods[index].start):dateNumber(periods[index].start.slice(0,10)),cx=x(Math.max(start,at)),cy=bottom-value/max*(bottom-top);
-            path+=`${connected?'L':'M'}${cx},${cy} `;connected=true;
-            const point=svgNode('circle',{cx,cy,r:hourly||selectedGranularity==='daily'?2.5:3.5,fill:color,stroke:'#fff','stroke-width':1});
-            const period=periods[index];
-            tip(point,`${period.label} · ${fmtTime(period.start)} – ${fmtTime(period.end)}${period.end_exclusive?' (end excluded)':''} · ${label}: ${number(value)} ${unit} · ${tokens?'recorded usage':number(m.count)+' samples'}`);
-            points.push(point);
-        });
-        svg.append(svgNode('path',{d:path,fill:'none',stroke:color,'stroke-width':2,'stroke-linejoin':'round'}),...points);
+    const hover=svgNode('g',{visibility:'hidden','pointer-events':'none'});
+    if(o.kind==='bars'){
+        const gap=band>=5?Math.max(2,band*.28):0,bw=Math.max(1,Math.min(24,band-gap)),radius=bw>=8?4:0,base=new Array(n).fill(0);
+        const hl=svgNode('rect',{y:y0,height:y1-y0,width:Math.max(bw+6,band),rx:4,style:'fill:var(--surface-3);opacity:.7'});hover.append(hl);svg.insertBefore(hover,svg.firstChild.nextSibling);
+        const topIndex=o.periods.map((_,i)=>{let t=-1;o.series.forEach((s,j)=>{if(s.values[i]>0)t=j});return t});
+        o.series.forEach((s,j)=>{let d='';s.values.forEach((v,i)=>{if(!(v>0))return;let ya=y(base[i]),yb=y(base[i]+v);const isTop=topIndex[i]===j;
+            if(base[i]>0&&ya-yb>3&&bw>=4)ya-=1;if(!isTop&&ya-yb>3&&bw>=4)yb+=1;
+            d+=roundedTop(x(i)-bw/2,ya,Math.min(yb,ya-(spark?.5:1)),bw,isTop?Math.min(radius,(ya-yb)/2):0);base[i]+=v});
+            svg.append(svgNode('path',{d,style:`fill:${s.color}`}))});
+        hover.dataset.kind='bars';hover.update=i=>{hl.setAttribute('x',x(i)-Math.max(bw+6,band)/2)};
+    }else{
+        const markers=[];
+        o.series.forEach(s=>{let d='',run=0;const solo=[];
+            s.values.forEach((v,i)=>{if(v===null||v===undefined){if(run===1)solo.push(i-1);run=0;return}d+=`${run?'L':'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`;run++});
+            if(run===1)solo.push(n-1);
+            if(o.area&&s.values.every(v=>v!==null))svg.append(svgNode('path',{d:`${d}L${x(n-1)},${y1}L${x(0)},${y1}Z`,style:`fill:${s.color};opacity:.1`}));
+            svg.append(svgNode('path',{d,fill:'none','stroke-width':spark?1.5:2,'stroke-linejoin':'round','stroke-linecap':'round',style:`stroke:${s.color}`}));
+            for(const i of solo)svg.append(svgNode('circle',{cx:x(i),cy:y(s.values[i]),r:spark?2:3,style:`fill:${s.color}`}));
+            const m=svgNode('circle',{r:4,'stroke-width':2,style:`fill:${s.color};stroke:var(--surface)`});markers.push([m,s]);});
+        const vl=svgNode('line',{y1:y0,y2:y1,style:'stroke:var(--axis)','shape-rendering':'crispEdges'});hover.append(vl,...markers.map(([m])=>m));svg.append(hover);
+        hover.update=i=>{vl.setAttribute('x1',x(i));vl.setAttribute('x2',x(i));for(const [m,s] of markers){const v=s.values[i];m.setAttribute('visibility',v===null||v===undefined?'hidden':'visible');if(v!==null&&v!==undefined){m.setAttribute('cx',x(i));m.setAttribute('cy',y(v))}}};
     }
-    const days=Math.round((dateNumber(trendEnd)-dateNumber(trendStart))/86400000),ticks=hourly?(end>start?Math.max(1,Math.min(5,Math.floor((end-start)/3600000))):0):Math.min(5,days);
-    for(let i=0;i<=ticks;i++){
-        const at=hourly?(i===ticks?end:start+Math.round((end-start)*i/ticks/3600000)*3600000):start+(ticks?Math.round(days*i/ticks):0)*86400000;
-        const label=hourly?new Date(at).toLocaleString('en-US',{hour:'numeric',minute:'2-digit',...(days?{month:'short',day:'numeric'}:{}),timeZone:data.timezone}):new Date(at).toLocaleDateString('en-US',{month:'short',day:'numeric',...(days>365?{year:'2-digit'}:{}),timeZone:'UTC'});
-        svg.append(svgNode('text',{x:x(at),y:213,'text-anchor':ticks===0?'middle':i===0?'start':i===ticks?'end':'middle',fill:'#8290a1','font-size':10},label));
-    }
+    const overlay=svgNode('rect',{x:left,y:0,width:right-left,height:y1,fill:'transparent'});svg.append(overlay);
+    let current=-1;
+    const show=(i,cx,cy)=>{current=i;hover.setAttribute('visibility','visible');hover.update(i);
+        const rows=o.series.map(s=>({color:s.color,line:o.kind!=='bars',value:s.values[i]===null||s.values[i]===undefined?'—':o.format(s.values[i]),name:s.name,raw:s.values[i]}));
+        const shown=o.stacked?rows.filter(r=>r.raw>0).reverse():rows;
+        if(o.stacked&&o.series.length>1)shown.push({value:o.format(sums[i]),name:'Total'});
+        if(!shown.length)shown.push({value:o.format(0),name:o.series.length>1?'Total':o.series[0].name});
+        showTip(cx,cy,periodLabel(o.periods[i],o.granularity,true),shown,o.note?o.note(i):'')};
+    const fromPointer=e=>{const r=svg.getBoundingClientRect();return Math.max(0,Math.min(n-1,Math.floor((e.clientX-r.left-left)/band)))};
+    overlay.addEventListener('pointermove',e=>show(fromPointer(e),e.clientX,e.clientY));
+    overlay.addEventListener('pointerleave',()=>{hover.setAttribute('visibility','hidden');hideTip()});
+    if(!spark){svg.setAttribute('tabindex','0');svg.setAttribute('aria-label',`${o.label}. Use arrow keys to read values.`);
+        const atKey=i=>{const r=svg.getBoundingClientRect();show(i,r.left+x(i),r.top+y0+20)};
+        svg.addEventListener('focus',()=>atKey(current>=0?current:n-1));svg.addEventListener('blur',()=>{hover.setAttribute('visibility','hidden');hideTip()});
+        svg.addEventListener('keydown',e=>{const step={ArrowLeft:-1,ArrowRight:1,Home:-n,End:n,PageUp:-10,PageDown:10}[e.key];if(e.key==='Escape'){hideTip();return}if(step===undefined)return;e.preventDefault();atKey(Math.max(0,Math.min(n-1,(current<0?n-1:current)+step)))});}
     return svg;
+}}
+
+// Scope helpers: every view reads from the same filter selection
+const scopeGroup=s=>{let g=s.harness?data.by_harness[s.harness]:data;if(g&&s.tier)g=g.by_tier[s.tier];if(g&&s.mode)g=g.by_mode[s.mode];return g||null};
+const scopeWindows=s=>{const g=scopeGroup(s);return g?(s.model?g.by_model[s.model]:g.windows)||null:null};
+const scopeTrends=(s,granularity)=>{const g=scopeGroup(s);const t=g&&(s.model?g.by_model_trends[s.model]:g.trends);return t?t[granularity]:null};
+const filters=()=>({harness:state.harness,tier:state.tier,mode:state.mode,model:state.model});
+const harnessGroup=()=>state.harness?data.by_harness[state.harness]:data;
+const tierGroup=()=>state.tier?harnessGroup().by_tier[state.tier]:harnessGroup();
+const activeModels=()=>state.mode?tierGroup().by_mode[state.mode].by_model:tierGroup().by_model;
+const activeWindows=()=>scopeWindows(filters());
+const hasActivity=windows=>windows&&windows.some(w=>w.conversations>0||w.total_tokens>0);
+const longest=windows=>windows[windows.length-1];
+
+function rangedPeriods(granularity){
+    const firstDay=data.trend_periods.daily.find(p=>p.start.slice(0,10)===state.start)||data.trend_periods.daily[0],rangeStart=Date.parse(firstDay.start);
+    return data.trend_periods[granularity].map((period,index)=>({period,index})).filter(({period})=>period.start.slice(0,10)<=state.end&&(Date.parse(period.end)>rangeStart||Date.parse(period.end)===rangeStart&&!period.end_exclusive));
 }
-function legend(){const el=text('div','','legend');visibleChartStats().forEach(([,name,color])=>{const s=text('span',name),dot=text('i','','swatch');dot.style.background=color;s.prepend(dot);el.append(s)});return el}
-function performance(window){$('token-chart').replaceChildren(metricChart('total_tokens','Total tokens over time','tokens'));$('trend-caption').textContent=`${trendStart} – ${trendEnd} · calendar period statistics · ${visibleChartStats().map(([,label])=>label).join(', ')||'no statistics selected'}`;$('performance').replaceChildren();for(const [key,title,unit,desc] of metricDefs){const panel=text('article','','panel'),top=text('div','','panel-top'),heading=text('div','');heading.append(text('h3',title),text('p',desc));top.append(heading,text('span',unit,'unit'));panel.append(top,legend());const chart=text('div','','chart');chart.append(metricChart(key,title,unit));panel.append(chart);const stats=text('div','','stats');for(const [stat,label] of statDefs){const e=text('div','','stat');e.append(text('span',label.toUpperCase()),text('strong',displayMetric(key,window.metrics[key][stat])));stats.append(e)}panel.append(stats,text('div',`${number(window.metrics[key].count)} valid ${key==='length'||key==='tools'?'conversation':'turn'} samples · ${window.label}`,'samples'));$('performance').append(panel)}}
-function donut(categories,field,total,title){const svg=svgBase(title,190,190),cx=95,cy=95,r=68,length=2*Math.PI*r;svg.append(svgNode('circle',{cx,cy,r,fill:'none',stroke:'#edf1f6','stroke-width':20}));let offset=0;categories.forEach((cat,i)=>{const value=Number(cat[field]);if(value<=0||total<=0)return;const segment=value/total*length,circle=svgNode('circle',{cx,cy,r,fill:'none',stroke:colors[i],'stroke-width':20,'stroke-dasharray':`${segment} ${length-segment}`,'stroke-dashoffset':-offset,transform:'rotate(-90 95 95)'});tip(circle,`${cat.name}: ${field==='cost'?money(value):number(value)} (${number(value/total*100)}%)`);svg.append(circle);offset+=segment});svg.append(svgNode('text',{x:95,y:94,'text-anchor':'middle',fill:'#172a3c','font-size':22,'font-weight':650},field==='cost'?money(total):compact(total)),svgNode('text',{x:95,y:116,'text-anchor':'middle',fill:'#8290a1','font-size':10},field==='cost'?'ESTIMATED USD':'TOTAL TOKENS'));return svg}
-function breakdowns(window){$('breakdowns').replaceChildren();for(const field of ['tokens','cost']){const panel=text('article','','panel'),title=field==='tokens'?'Token composition':'Cost composition';panel.append(text('h3',title),text('p',field==='tokens'?'Separate categories · each token counted once':`Estimated API-equivalent token cost${window.partial_cost?' · partial':''}`));const body=text('div','','breakdown-body');body.append(donut(window.categories,field,field==='tokens'?window.total_tokens:Number(window.cost),title));const wrap=text('div','','table-wrap'),t=document.createElement('table');table(t,['Category',field==='tokens'?'Tokens':'USD'],[]);const tbody=t.querySelector('tbody');window.categories.forEach((cat,i)=>{const tr=document.createElement('tr'),label=text('td',cat.name,'label'),dot=text('i','','swatch');dot.style.background=colors[i];dot.style.marginRight='7px';label.prepend(dot);const value=field==='tokens'?number(cat.tokens):money(cat.cost);tr.append(label,text('td',value+(field==='cost'&&cat.unpriced_tokens?' *':''),'num'));tbody.append(tr)});const foot=document.createElement('tfoot'),row=document.createElement('tr');row.append(text('td','Total'),text('td',field==='tokens'?number(window.total_tokens):money(window.cost),'num'));foot.append(row);t.append(foot);wrap.append(t);body.append(wrap);panel.append(body);if(field==='cost'&&window.partial_cost)panel.append(text('p',`* ${number(window.unpriced_tokens)} tokens excluded from the API estimate; see unpriced usage and recorded billing below.`));$('breakdowns').append(panel)}}
-function selectWindow(index){selected=index;modelOptions();recordedBilling();$('tooltip').hidden=true;const w=activeWindows()[index];$('model-scope').textContent=`${selectedHarness||'All harnesses'} · ${selectedTier||'All tiers'} · ${selectedModel||'All models'} · ${selectedMode||'All modes'}`;[...$('tabs').children].forEach((b,i)=>b.setAttribute('aria-pressed',i===index));$('range').textContent=w.end_exclusive?`${fmtDate(w.start)} · full calendar day`:`${fmtDate(w.start)} – ${fmtTime(w.end)}`;$('notice').hidden=!w.partial_cost&&!Object.keys(data.quality).some(k=>k.startsWith('Malformed')||k==='Unreadable files'||k==='Invalid usage records');$('notice').textContent=w.partial_cost?`Partial cost estimate: ${number(w.unpriced_tokens)} tokens lack a verified rate or the category detail needed to calculate cost. Their usage is included in token totals.`:'Some records could not be read. Review parser diagnostics below.';$('cards').replaceChildren();const cards=[['Conversations',number(w.conversations),'Active threads, including subagents',colors[0]],['Total tokens',compact(w.total_tokens),`${number(w.total_tokens)} recorded tokens`,colors[1]],['Active duration',number(w.active_seconds/3600)+' h','Completed turn durations, summed',colors[2]],['Estimated cost',money(w.cost),w.partial_cost?'Partial estimate · USD':'USD · API-equivalent estimate',colors[3]]];for(const [label,value,note,color] of cards){const c=text('article','','card');c.style.setProperty('--accent',color);c.append(text('div',label,'card-label'),text('div',value,'card-value'),text('div',note,'card-note'));if(label==='Total tokens'){const totals=document.createElement('dl');totals.className='token-totals';for(const [name,count] of [['Input (includes cached)',w.input_tokens],['Output (includes reasoning)',w.output_tokens],['Cached input',w.cached_input_tokens]]){const row=document.createElement('div');row.append(text('dt',name),text('dd',number(count)));totals.append(row)}c.append(totals)}$('cards').append(c)}performance(w);breakdowns(w);tierComparison();modelComparison();exactMetrics();const coverage=[['Completed turns',w.coverage['Completed turns']||0],['First-token timing samples',w.metrics.ttft.count],['Missing first-token timing',w.coverage['Missing first-token timing']||0],['Missing turn duration',w.coverage['Missing turn duration']||0],['Throughput samples',w.metrics.throughput.count],['Missing throughput samples',w.coverage['Missing throughput samples']||0],['Conversation duration samples',w.metrics.length.count],['Aborted turns',w.coverage['Aborted turns']||0],['Unfinished turns started in window',w.coverage['Unfinished turns']||0],['Usage responses',w.coverage['Usage responses']||0],['Tool calls',w.tool_calls]];table($('coverage'),['Measurement','Count'],coverage.map(([k,v])=>[k,number(v)]));$('unpriced').replaceChildren();if(w.partial_cost){const t=document.createElement('table');table(t,['Model','Unpriced tokens'],Object.entries(w.unpriced).map(([k,v])=>[k,number(v)]));$('unpriced').append(t)}else $('unpriced').append(text('p','All recorded usage in this window has a published or assumed rate.'));table($('models'),['Model','Total tokens'],Object.entries(w.models).filter(([,tokens])=>tokens>0).map(([k,v])=>[k,number(v)]))}
-for(const [stat,label] of statDefs){const option=text('option',label);option.value=stat;$('comparison-stat-select').append(option);}
+const measureValue=(point,measure)=>point?(measure==='cost'?Number(point.cost||0):point.total_tokens):0;
+
+// Split entities keep their color across window and date changes
+// Models are ordered once by all-history tokens, so filters never repaint a model
+const modelOrder=Object.entries(data.by_model).map(([name,ws])=>[name,Math.max(...ws.map(w=>w.total_tokens))]).filter(([,t])=>t>0).sort((a,b)=>b[1]-a[1]).map(([name])=>name);
+const entityNames={model:()=>modelOrder,harness:()=>Object.keys(data.by_harness),tier:()=>Object.keys(data.by_tier),mode:()=>Object.keys(data.by_mode)};
+const entityColor=(dim,name)=>{const i=entityNames[dim]().indexOf(name);return i>=0&&i<SLOTS?`var(--s${i+1})`:'var(--other)'};
+function splitEntities(split){
+    const base=filters();
+    if(split==='none')return [{name:'All activity',scope:base,color:'var(--s1)'}];
+    const available=split==='model'?activeModels():split==='harness'?data.by_harness:split==='tier'?harnessGroup().by_tier:harnessGroup().by_mode;
+    const names=[...entityNames[split]().filter(n=>n in available),...Object.keys(available).filter(n=>!entityNames[split]().includes(n))];
+    return names.filter(name=>!state[split]||name===state[split]).map(name=>({name,scope:{...base,[split]:name},color:entityColor(split,name)}));
+}
+
+// Usage over time
+function usageSeries(granularity,entries,measure){
+    const series=splitEntities(state.split).map(e=>{const trends=scopeTrends(e.scope,granularity);return {name:e.name,color:e.color,values:entries.map(({index})=>measureValue(trends?.[index],measure)),partial:entries.map(({index})=>!!trends?.[index]?.partial_cost)}}).filter(s=>state.split==='none'||s.values.some(v=>v>0));
+    const named=series.filter(s=>s.color!=='var(--other)'),rest=series.filter(s=>s.color==='var(--other)');
+    if(rest.length>1){const kept=named;kept.push({name:`Other (${rest.length})`,color:'var(--other)',values:entries.map((_,i)=>rest.reduce((t,s)=>t+s.values[i],0)),partial:entries.map((_,i)=>rest.some(s=>s.partial[i]))});return kept}
+    return series;
+}
+function usage(){
+    const g=state.granularity,entries=rangedPeriods(g),periods=entries.map(e=>e.period),measure=state.measure,isCost=measure==='cost';
+    const per={hourly:'hour',daily:'day',weekly:'week',monthly:'month'}[g];
+    $('usage-title').textContent=`${isCost?'Estimated cost':'Tokens'} per ${per}`;
+    $('usage-desc').textContent=isCost?'API-equivalent USD estimate per period at current rates':'Input plus output tokens per period · includes cached input and reasoning';
+    const series=usageSeries(g,entries,measure),total=series.reduce((t,s)=>t+s.values.reduce((a,b)=>a+b,0),0),fmt=isCost?money:v=>integer(v);
+    $('usage-legend').replaceChildren(...(series.length>1?series.map(s=>{const l=text('span',s.name);l.prepend(key(s.color));return l}):[]));
+    const partial=entries.map((_,i)=>series.some(s=>s.partial[i]));
+    mount($('usage-chart'),timeChart({periods,granularity:g,series,kind:'bars',stacked:true,label:`${$('usage-title').textContent}, ${state.start} to ${state.end}`,format:isCost?money:v=>integer(v),axis:isCost?moneyAxis:compact,note:i=>partial[i]?'Partial estimate · some usage lacks a rate':'',empty:'No recorded usage in this range.'}));
+    const peak=series.length?periods.map((_,i)=>series.reduce((t,s)=>t+s.values[i],0)).reduce((best,v,i,a)=>v>a[best]?i:best,0):-1;
+    $('trend-caption').textContent=`${day(state.start,{month:'short',day:'numeric',year:'numeric'})} – ${day(state.end,{month:'short',day:'numeric',year:'numeric'})} · ${fmt(total)} ${isCost?'estimated':'tokens'} across ${integer(periods.length)} ${per}${periods.length===1?'':'s'}${peak>=0&&total>0?` · busiest ${per}: ${periodLabel(periods[peak],g,true)}`:''}`;
+    const tableHost=$('usage-table');tableHost.replaceChildren(toggleButton('usageTable',()=>usage()));
+    if(state.usageTable){const wrap=text('div','','data-table'),t=document.createElement('table');table(t,['Period',...series.map(s=>s.name),...(series.length>1?['Total']:[])],periods.map((p,i)=>[periodLabel(p,g,true),...series.map(s=>fmt(s.values[i])),...(series.length>1?[fmt(series.reduce((a,s)=>a+s.values[i],0))]:[])]));wrap.append(t);tableHost.append(wrap)}
+    heatmap();
+}
+function toggleButton(flag,rerender){const b=text('button',state[flag]?'Hide data table':'Show data table','link-btn view-toggle');b.type='button';b.setAttribute('aria-expanded',state[flag]);b.style.marginTop='10px';b.addEventListener('click',()=>{state[flag]=!state[flag];rerender()});return b}
+
+// Weekday × hour heatmap of hourly tokens in the chosen range
+const weekdays=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+function heatmap(){
+    const entries=rangedPeriods('hourly'),trends=scopeTrends(filters(),'hourly')||[],grid=weekdays.map(()=>new Array(24).fill(0));
+    for(const {period,index} of entries){const v=trends[index]?.total_tokens||0;if(!v)continue;const d=(new Date(period.label.slice(0,10)+'T00:00:00Z').getUTCDay()+6)%7;grid[d][Number(period.label.slice(11,13))]+=v}
+    const max=Math.max(0,...grid.flat()),total=grid.flat().reduce((a,b)=>a+b,0);
+    let best=[0,0];grid.forEach((row,d)=>row.forEach((v,h)=>{if(v>grid[best[0]][best[1]])best=[d,h]}));
+    $('heat-desc').textContent=total?`Tokens by weekday and hour (${data.timezone}) · peak ${weekdays[best[0]]} ${String(best[1]).padStart(2,'0')}:00 with ${percent(grid[best[0]][best[1]],total)} of usage`:'Tokens by weekday and hour of the report timezone';
+    const level=v=>v<=0?0:Math.min(7,1+Math.floor(v/max*7*.9999));
+    mount($('heat-chart'),width=>{
+        if(!total)return text('div','No recorded usage in this range.','empty');
+        const left=38,cw=Math.max(6,(width-left)/24),ch=Math.min(26,Math.max(14,cw*.8)),height=7*ch+22;
+        const svg=svgNode('svg',{width,height,viewBox:`0 0 ${width} ${height}`,role:'img','aria-label':'Token usage by weekday and hour'});
+        grid.forEach((row,d)=>{svg.append(svgNode('text',{x:0,y:d*ch+ch/2+4},weekdays[d]));row.forEach((v,h)=>{
+            const cell=svgNode('rect',{x:left+h*cw+1,y:d*ch+1,width:cw-2,height:ch-2,rx:3,style:`fill:var(--q${level(v)})`});
+            const label=`${weekdays[d]} ${String(h).padStart(2,'0')}:00`;
+            const show=e=>{const r=cell.getBoundingClientRect();cell.style.stroke='var(--ink)';showTip(e.clientX||r.right,e.clientY||r.top,label,[{value:integer(v),name:'tokens'},{value:percent(v,total),name:'of usage in range'}])};
+            cell.addEventListener('pointerenter',show);cell.addEventListener('pointermove',show);cell.addEventListener('pointerleave',()=>{cell.style.stroke='';hideTip()});svg.append(cell)})});
+        for(let h=0;h<24;h+=3)svg.append(svgNode('text',{x:left+h*cw+cw/2,y:height-4,'text-anchor':'middle'},`${String(h).padStart(2,'0')}h`));
+        return svg});
+    $('heat-legend').replaceChildren(...(total?[text('span','Less'),...[0,1,2,3,4,5,6,7].map(i=>{const k=text('i');k.style.background=`var(--q${i})`;return k}),text('span',`More · max ${compact(max)} tokens per cell`)]:[]));
+    const host=$('heat-table');host.replaceChildren(...(total?[toggleButton('heatTable',heatmap)]:[]));
+    if(state.heatTable&&total){const wrap=text('div','','data-table'),t=document.createElement('table');table(t,['Day',...Array.from({length:24},(_,h)=>String(h).padStart(2,'0'))],grid.map((row,d)=>[weekdays[d],...row.map(v=>v?compact(v):'·')]));wrap.append(t);host.append(wrap)}
+}
+
+// Performance distributions
+function performance(w){
+    const entries=rangedPeriods(state.granularity),periods=entries.map(e=>e.period),trends=scopeTrends(filters(),state.granularity)||[],shown=chartStats.filter(([s])=>state.stats.has(s));
+    $('performance').replaceChildren();
+    for(const def of metricDefs){
+        const m=w.metrics[def.key],card=text('article','','card'),head=text('div','','card-head'),h=text('div');h.append(text('h3',def.title),text('p',def.desc));head.append(h);card.append(head);
+        const headline=text('div','','headline');headline.append(text('strong',m.median===null?'—':def.format(m.median)),text('span',m.median===null?`No samples · ${data.windows[state.window].label}`:`median · P95 ${def.format(m.p95)} · ${data.windows[state.window].label}`));card.append(headline);
+        if(shown.length>1){const legend=text('div','','legend');shown.forEach(([,label,color])=>{const l=text('span',label);l.prepend(key(color,true));legend.append(l)});card.append(legend)}
+        const chart=text('div','','chart');card.append(chart);
+        const dist=text('dl','','dist');for(const [stat,label] of distOrder){const d=text('div');d.append(text('dt',label),text('dd',m[stat]===null?'—':def.format(m[stat])));dist.append(d)}
+        card.append(dist,text('p',`${integer(m.count)} valid ${def.sample} sample${m.count===1?'':'s'} in ${data.windows[state.window].label.toLowerCase()}`,'samples'));
+        $('performance').append(card);
+        const series=shown.map(([stat,label,color])=>({name:label,color,values:entries.map(({index})=>{const v=trends[index]?.[def.key]?.[stat];return v===null||v===undefined?null:def.chart(v)})}));
+        mount(chart,shown.length?timeChart({periods,granularity:state.granularity,series,kind:'lines',height:200,label:`${def.title} by ${state.granularity} period`,axis:def.axis,format:v=>def.format(def.key==='length'?v*60:v),note:i=>{const c=trends[entries[i].index]?.[def.key]?.count;return c?`${integer(c)} ${def.sample} sample${c===1?'':'s'}`:'No samples'},empty:'No valid samples in this range.'}):()=>text('div','Select a statistic above to draw the trend.','empty'));
+    }
+}
+
+// Summary tiles with sparklines over the selected window
+function windowSpark(w,measure){
+    const hourly=['Today','Yesterday'].includes(data.windows[state.window].label),granularity=hourly?'hourly':'daily',start=Date.parse(w.start),end=Date.parse(w.end);
+    const entries=data.trend_periods[granularity].map((period,index)=>({period,index})).filter(({period})=>Date.parse(period.end)>start&&Date.parse(period.start)<(w.end_exclusive?end:end+1));
+    const trends=scopeTrends(filters(),granularity)||[];
+    return {periods:entries.map(e=>e.period),granularity,values:entries.map(({index})=>measure(trends[index]))};
+}
+function cards(w){
+    const tools=w.metrics.tools,activeShare=w.conversations?w.tool_calls/w.conversations:0;
+    const items=[
+        {label:'Estimated cost',value:money(w.cost),note:w.partial_cost?'Partial · some usage unpriced':'USD · API-equivalent',spark:p=>p?Number(p.cost):0,fmt:money},
+        {label:'Total tokens',value:compact(w.total_tokens),note:`${integer(w.total_tokens)} tokens`,spark:p=>p?p.total_tokens:0,fmt:integer,split:[['Input',w.input_tokens],['Output',w.output_tokens],['Cached input',w.cached_input_tokens]]},
+        {label:'Conversations',value:integer(w.conversations),note:'Active threads incl. subagents',spark:p=>p?p.tools.count:0,fmt:integer},
+        {label:'Active time',value:duration(w.active_seconds),note:'Completed turn durations, summed',spark:p=>p&&p.length.avg!==null?p.length.avg*p.length.count:0,fmt:duration},
+        {label:'Tool calls',value:integer(w.tool_calls),note:w.conversations?`${number(activeShare,1)} per conversation`:'Model-issued calls',spark:p=>p&&p.tools.avg!==null?Math.round(p.tools.avg*p.tools.count):0,fmt:integer}];
+    $('cards').replaceChildren();
+    for(const item of items){
+        const c=text('article','','card kpi');c.append(text('div',item.label,'kpi-label'),text('div',item.value,'kpi-value'),text('div',item.note,'kpi-note'));
+        if(item.split){const dl=text('dl','','kpi-split');for(const [name,count] of item.split){const row=text('div');row.append(text('dt',name),text('dd',compact(count)));row.title=`${name}: ${integer(count)} tokens`;dl.append(row)}c.append(dl)}
+        const s=windowSpark(w,item.spark),spark=text('div','','chart spark');c.append(spark);$('cards').append(c);
+        if(s.periods.length>1)mount(spark,timeChart({periods:s.periods,granularity:s.granularity,series:[{name:item.label,color:'var(--accent)',values:s.values}],kind:'lines',area:true,spark:true,label:`${item.label} per ${s.granularity==='hourly'?'hour':'day'}`,format:item.fmt}));
+        else spark.remove();
+    }
+}
+
+// Token and cost composition
+function composition(w){
+    const host=$('composition'),cats=w.categories.map((c,i)=>({...c,cost:Number(c.cost),color:`var(--s${i+1})`,ink:i>=5?`var(--on-s${i+1})`:'#0b0b0b'})),totalCost=Number(w.cost);
+    host.replaceChildren();
+    const head=text('div','','card-head'),h=text('div');h.append(text('h3','Token and cost composition'),text('p',`${data.windows[state.window].label} · share of total by category${w.partial_cost?' · cost is a partial estimate':''}`));head.append(h);host.append(head);
+    const legend=text('div','','legend');cats.forEach(c=>{const l=text('span',c.name);l.prepend(key(c.color));legend.append(l)});host.append(legend);
+    const bars=text('div','','composition');host.append(bars);
+    if(!w.total_tokens){bars.append(text('div','No recorded usage in this window.','empty'));return}
+    for(const [label,field,total,fmt] of [['Tokens','tokens',w.total_tokens,compact],['Cost','cost',totalCost,money]]){
+        const row=text('div','','comp-row'),bar=text('div','','bar100');bar.setAttribute('role','img');
+        bar.setAttribute('aria-label',`${label}: `+cats.map(c=>`${c.name} ${percent(c[field],total)}`).join(', '));
+        row.append(text('span',label),bar,text('span',fmt(total)));bars.append(row);
+        mount(bar,width=>{const frag=document.createDocumentFragment();if(!(total>0)){const empty=text('div','No priced usage','dim');empty.style.flex='1';empty.style.background='var(--surface-2)';frag.append(empty);return frag}
+            cats.filter(c=>c[field]>0).forEach(c=>{const seg=text('div'),share=c[field]/total,label=percent(c[field],total);seg.style.flex=`${share} 1 0`;seg.style.background=c.color;seg.style.color=c.ink;if(share*width>=label.length*7+14)seg.textContent=label;
+                const show=e=>showTip(e.clientX,e.clientY,c.name,[{color:c.color,value:field==='cost'?money(c.cost):integer(c.tokens),name:field},{value:label,name:`of ${field==='cost'?'estimated cost':'tokens'}`}]);
+                seg.addEventListener('pointermove',show);seg.addEventListener('pointerleave',hideTip);frag.append(seg)});return frag});
+    }
+    const byTokens=[...cats].sort((a,b)=>b.tokens-a.tokens)[0],byCost=[...cats].sort((a,b)=>b.cost-a.cost)[0];
+    if(totalCost>0)host.append(text('p',byTokens===byCost?`${byTokens.name} is the largest share of both tokens (${percent(byTokens.tokens,w.total_tokens)}) and estimated cost (${percent(byTokens.cost,totalCost)}).`:`${byTokens.name} is ${percent(byTokens.tokens,w.total_tokens)} of tokens but only ${percent(byTokens.cost,totalCost)} of cost; ${byCost.name.toLowerCase()} drives the most spend at ${percent(byCost.cost,totalCost)}.`,'insight'));
+    const wrap=text('div','','table-wrap'),t=document.createElement('table');wrap.style.marginTop='14px';
+    table(t,['Category','Tokens','Share','Est. cost','Share','Blended $ / MTok'],cats.map(c=>{const name=text('span',c.name);name.prepend(key(c.color));name.firstChild.style.marginRight='8px';return [name,integer(c.tokens),percent(c.tokens,w.total_tokens),money(c.cost)+(c.unpriced_tokens?' *':''),percent(c.cost,totalCost),c.tokens?moneyRate(c.cost/c.tokens*1e6):'—']}),{foot:['Total',integer(w.total_tokens),'100%',money(w.cost),'100%',w.total_tokens?moneyRate(totalCost/w.total_tokens*1e6):'—']});
+    wrap.append(t);host.append(wrap);
+    if(w.partial_cost)host.append(text('p',`* ${integer(w.unpriced_tokens)} tokens lack a rate and are excluded from the estimate; see Pricing coverage below.`,'samples'));
+}
+
+// Comparison table across one dimension
+const compareDims=[['model','Model'],['tier','Tier'],['harness','Harness'],['mode','Mode']];
+function compareRows(){
+    const dim=state.compare,s=filters();let names;
+    if(dim==='model')names=Object.keys(activeModels());
+    else if(dim==='tier')names=Object.keys(harnessGroup().by_tier);
+    else if(dim==='harness')names=Object.keys(data.by_harness);
+    else names=Object.keys(harnessGroup().by_mode);
+    return names.map(name=>{const windows=scopeWindows({...s,[dim]:name});return {name,w:windows?.[state.window],color:entityColor(dim,name)}}).filter(r=>r.w&&(r.w.total_tokens>0||(dim!=='model'&&r.w.conversations>0)));
+}
+function comparison(){
+    const dim=state.compare,label=compareDims.find(([d])=>d===dim)[1],stat=state.statistic,statLabel=statDefs.find(([s])=>s===stat)[1];
+    const rows=compareRows(),maxTokens=Math.max(1,...rows.map(r=>r.w.total_tokens)),maxCost=Math.max(1e-9,...rows.map(r=>Number(r.w.cost))),totalCost=rows.reduce((t,r)=>t+Number(r.w.cost),0);
+    const columns=[['name',label,r=>r.name],['conversations','Conversations',r=>r.w.conversations],['tokens','Tokens',r=>r.w.total_tokens],['cost','Est. cost',r=>Number(r.w.cost)],
+        ...metricDefs.map(d=>[d.key,`${d.short} (${statLabel.toLowerCase()})`,r=>r.w.metrics[d.key][stat]])];
+    const sorter=columns.find(([k])=>k===state.sort)||columns[3],get=sorter[2];
+    rows.sort((a,b)=>{const x=get(a),y=get(b);if(x===null&&y===null)return 0;if(x===null)return 1;if(y===null)return -1;return (typeof x==='string'?x.localeCompare(y):x-y)*state.dir});
+    const t=$('comparison');t.replaceChildren();const head=document.createElement('thead'),tr=document.createElement('tr');
+    columns.forEach(([k,title],i)=>{const th=text('th','',i?'num':'');const b=text('button',title);b.type='button';b.addEventListener('click',()=>{if(state.sort===k)state.dir*=-1;else{state.sort=k;state.dir=k==='name'?1:-1}comparison();saveState()});th.append(b);if(state.sort===k)th.setAttribute('aria-sort',state.dir>0?'ascending':'descending');tr.append(th)});
+    head.append(tr);t.append(head);const body=document.createElement('tbody');
+    const selectedName=state[dim];
+    for(const r of rows){
+        const row=document.createElement('tr'),w=r.w;row.tabIndex=0;row.setAttribute('aria-selected',r.name===selectedName);row.title=r.name===selectedName?`Clear the ${label.toLowerCase()} filter`:`Filter the report to ${r.name}`;
+        const name=text('td',r.name);name.prepend(key(r.color));row.append(name,text('td',integer(w.conversations),'num'));
+        for(const [value,max,shown,color] of [[w.total_tokens,maxTokens,compact(w.total_tokens),'var(--accent)'],[Number(w.cost),maxCost,`${money(w.cost)}${w.partial_cost?'*':''}`,'var(--accent)']]){
+            const td=text('td','','num'),bar=text('div','','databar'),track=text('span','','track'),fill=text('i');fill.style.width=`${Math.max(value>0?2:0,value/max*90)}px`;fill.style.background=color;track.append(fill);bar.append(text('span',shown),track);td.append(bar);row.append(td)}
+        for(const d of metricDefs){const v=w.metrics[d.key][stat];row.append(text('td',v===null?'—':d.format(v),'num'+(v===null?' dim':'')))}
+        const pick=()=>{applyFilter(dim,r.name===selectedName?'':r.name)};
+        row.addEventListener('click',pick);row.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();pick()}});body.append(row);
+    }
+    if(!rows.length){const r=document.createElement('tr'),td=text('td','No recorded activity for this selection.','dim');td.colSpan=columns.length;r.append(td);body.append(r)}
+    t.append(body);
+    $('comparison-caption').textContent=`${data.windows[state.window].label} · ${statLabel} per timing metric · totals for conversations, tokens, and cost · ${rows.length} ${label.toLowerCase()}${rows.length===1?'':'s'} · ${money(totalCost)} total`;
+    $('comparison-note').textContent=`Select a row to filter the whole report. Conversations are counted once per ${label.toLowerCase()} and can appear in several, so they are not additive.${rows.some(r=>r.w.partial_cost)?' * Partial cost estimate.':''}`;
+}
+
+// Data quality
+function quality(w){
+    const c=w.coverage,completed=c['Completed turns']||0;
+    $('coverage-meters').replaceChildren();
+    for(const [label,have] of [['First-token timing',w.metrics.ttft.count],['Turn duration',completed-(c['Missing turn duration']||0)],['Throughput',w.metrics.throughput.count]]){
+        const row=text('div','','meter-row'),meter=text('div','','meter'),fill=text('i');fill.style.width=completed?`${Math.min(100,have/completed*100)}%`:'0';meter.append(fill);
+        meter.setAttribute('role','meter');meter.setAttribute('aria-label',label);meter.setAttribute('aria-valuemin','0');meter.setAttribute('aria-valuemax',String(completed));meter.setAttribute('aria-valuenow',String(have));
+        row.append(text('span',label),text('span',completed?`${integer(have)} of ${integer(completed)} · ${percent(have,completed)}`:'No completed turns','val'),meter);$('coverage-meters').append(row)}
+    $('coverage-counts').replaceChildren(...[['Completed turns',completed],['Aborted turns',c['Aborted turns']||0],['Unfinished turns',c['Unfinished turns']||0],['Usage responses',c['Usage responses']||0]].map(([k,v])=>{const d=text('div');d.append(text('dt',k),text('dd',integer(v)));return d}));
+    const coverage=[['Completed turns',completed],['First-token timing samples',w.metrics.ttft.count],['Missing first-token timing',c['Missing first-token timing']||0],['Missing turn duration',c['Missing turn duration']||0],['Throughput samples',w.metrics.throughput.count],['Missing throughput samples',c['Missing throughput samples']||0],['Conversation duration samples',w.metrics.length.count],['Aborted turns',c['Aborted turns']||0],['Unfinished turns started in window',c['Unfinished turns']||0],['Usage responses',c['Usage responses']||0],['Aggregate snapshots',c['Aggregate snapshots']||0],['Tool calls',w.tool_calls]];
+    table($('coverage'),['Measurement','Count'],coverage.map(([k,v])=>[k,integer(v)]));
+    $('unpriced').replaceChildren();
+    if(w.partial_cost){$('unpriced').append(text('p',`⚠ ${integer(w.unpriced_tokens)} tokens have no rate and are excluded from estimated cost:`,'samples'));const t=document.createElement('table');table(t,['Model','Unpriced tokens'],Object.entries(w.unpriced).map(([k,v])=>[k,integer(v)]));$('unpriced').append(t)}
+    else $('unpriced').append(text('p','✓ All recorded usage in this window has a published or assumed rate.','samples'))
+    const units=harnessGroup().windows[state.window].recorded_billing;
+    table($('recorded-billing'),['Recorded measurement','Amount'],Object.entries(units).map(([unit,amount])=>[unit,unit.endsWith('USD')?money(amount):number(amount)]),{empty:'No recorded billing units in this window.'});
+    const visible=new Set(Object.entries(activeModels()).filter(([,ws])=>ws[state.window].total_tokens>0).map(([name])=>name));
+    table($('router-prices'),['Model','OpenRouter ID','Input / MTok','Cache read / MTok','Output / MTok'],Object.entries(data.openrouter_rates).filter(([model])=>visible.has(model)).map(([model,r])=>[model,r.id,money(r.input),r.cached===null?'N/A':money(r.cached),money(r.output)]),{textColumns:[1],empty:'No models in this selection use OpenRouter catalog rates.'});
+}
+function exactMetrics(){const rows=[];for(const w of activeWindows())for(const def of metricDefs){const m=w.metrics[def.key];rows.push([`${w.label} · ${def.title}`,...['avg','min','median','max','p75','p95','p99'].map(s=>m[s]===null?'—':def.format(m[s])),integer(m.count)])}table($('all-metrics'),['Window / metric','Average','Minimum','Median','Maximum','P75','P95','P99','Samples'],rows)}
+
+// Filters
+function options(select,values,allLabel,current){select.replaceChildren(text('option',allLabel));select.firstChild.value='';for(const v of values){const o=text('option',v);o.value=v;select.append(o)}select.value=current;select.dataset.active=!!current}
+function syncFilters(){
+    const harnesses=Object.keys(data.by_harness);
+    if(state.harness&&!harnesses.includes(state.harness))state.harness='';
+    options($('harness-select'),harnesses,'All harnesses',state.harness);
+    const tiers=Object.entries(harnessGroup().by_tier).filter(([name,g])=>hasActivity(g.windows)||name===state.tier).map(([name])=>name);
+    if(state.tier&&!Object.hasOwn(harnessGroup().by_tier,state.tier))state.tier='';
+    options($('tier-select'),tiers,'All tiers',state.tier);
+    const modes=Object.entries(harnessGroup().by_mode).filter(([name,g])=>hasActivity(g.windows)||name===state.mode).map(([name])=>name);
+    if(state.mode&&!Object.hasOwn(harnessGroup().by_mode,state.mode))state.mode='';
+    options($('mode-select'),modes,'All modes',state.mode);
+    // A model with no tokens in the selected window would leave every view empty.
+    if(state.model&&!(Object.hasOwn(activeModels(),state.model)&&activeModels()[state.model][state.window].total_tokens>0))state.model='';
+    const models=Object.entries(activeModels()).filter(([,ws])=>ws[state.window].total_tokens>0).sort((a,b)=>b[1][state.window].total_tokens-a[1][state.window].total_tokens).map(([name])=>name);
+    options($('model-select'),models,`All models (${models.length})`,state.model);
+}
+function applyFilter(dim,value){state[dim]=value;render()}
+for(const [id,dim] of [['harness-select','harness'],['tier-select','tier'],['model-select','model'],['mode-select','mode']])$(id).addEventListener('change',()=>applyFilter(dim,$(id).value));
+function chips(){
+    const host=$('scope-chips');host.replaceChildren();const active=[['harness','Harness'],['tier','Tier'],['model','Model'],['mode','Mode']].filter(([d])=>state[d]);
+    if(!active.length){host.append(text('span','All harnesses, tiers, models, and modes'));return}
+    for(const [d,label] of active){const chip=text('span',`${label}: ${state[d]}`,'chip'),b=text('button','×');b.type='button';b.setAttribute('aria-label',`Remove ${label.toLowerCase()} filter`);b.addEventListener('click',()=>applyFilter(d,''));chip.append(b);host.append(chip,document.createTextNode(' '))}
+    if(active.length>1){const clear=text('button','Clear all','link-btn');clear.type='button';clear.addEventListener('click',()=>{for(const [d] of active)state[d]='';render()});host.append(clear)}
+}
+
+// State persists in the URL hash so a view can be reloaded or shared
+function saveState(){const p=new URLSearchParams();const put=(k,v,d)=>{if(v!==d)p.set(k,v)};put('w',String(state.window),'0');put('h',state.harness,'');put('t',state.tier,'');put('m',state.model,'');put('md',state.mode,'');put('g',state.granularity,'daily');put('from',state.start,firstDate);put('to',state.end,cutoffDate);put('measure',state.measure,'tokens');put('split',state.split,'none');put('stats',[...state.stats].join(','),'median,p95');put('cmp',state.compare,'model');put('stat',state.statistic,'median');put('sort',`${state.sort}:${state.dir}`,'cost:-1');
+    const hash=p.toString();try{history.replaceState(null,'',hash?'#'+hash:location.pathname+location.search)}catch(error){}}
+function loadState(){
+    let p;try{p=new URLSearchParams(location.hash.slice(1))}catch(error){return}
+    const w=Number(p.get('w'));if(Number.isInteger(w)&&w>=0&&w<data.windows.length)state.window=w;
+    for(const [k,f] of [['h','harness'],['t','tier'],['m','model'],['md','mode']])if(p.get(k))state[f]=p.get(k);
+    if(['hourly','daily','weekly','monthly'].includes(p.get('g')))state.granularity=p.get('g');
+    const valid=d=>/^\d{4}-\d{2}-\d{2}$/.test(d||'')&&d>=firstDate&&d<=cutoffDate;
+    if(valid(p.get('from')))state.start=p.get('from');if(valid(p.get('to')))state.end=p.get('to');if(state.start>state.end){state.start=firstDate;state.end=cutoffDate}
+    if(['tokens','cost'].includes(p.get('measure')))state.measure=p.get('measure');
+    if(['none','model','harness','tier','mode'].includes(p.get('split')))state.split=p.get('split');
+    if(p.has('stats'))state.stats=new Set(p.get('stats').split(',').filter(s=>chartStats.some(([c])=>c===s)));
+    if(compareDims.some(([d])=>d===p.get('cmp')))state.compare=p.get('cmp');
+    if(statDefs.some(([s])=>s===p.get('stat')))state.statistic=p.get('stat');
+    const [sort,dir]=(p.get('sort')||'').split(':');if(sort){state.sort=sort;state.dir=dir==='1'?1:-1}
+}
+
+function render(){
+    hideTip();syncFilters();chips();
+    const w=activeWindows()[state.window],win=data.windows[state.window];
+    [...$('tabs').children].forEach((b,i)=>b.setAttribute('aria-pressed',i===state.window));
+    $('range').textContent=w.end_exclusive?`${fmtDate(w.start)} · full calendar day`:`${fmtDate(w.start)} – ${fmtTime(w.end)}`;
+    const damaged=Object.keys(data.quality).some(k=>k.startsWith('Malformed')||k==='Unreadable files'||k==='Invalid usage records');
+    const notice=$('notice');notice.hidden=!w.partial_cost&&!damaged;notice.replaceChildren(text('span','⚠'),text('span'));
+    notice.lastChild.append(text('b',w.partial_cost?'Partial cost estimate. ':'Some records could not be read. '),document.createTextNode(w.partial_cost?`${integer(w.unpriced_tokens)} tokens lack a verified rate or the category detail needed to calculate cost. Their usage is included in token totals.`:'Review parser diagnostics under Data quality.'));
+    cards(w);usage();performance(w);composition(w);comparison();quality(w);exactMetrics();saveState();
+    document.title=`${win.label} · Coding agents usage report`;
+}
+
+// Static controls
+data.windows.forEach((w,i)=>{const b=text('button',w.label.replace(/^Last /,''));b.type='button';b.title=w.label;b.addEventListener('click',()=>{state.window=i;render()});$('tabs').append(b)});
 for(const [stat,label,color] of chartStats){
-    const option=text('label',''),input=document.createElement('input'),swatch=text('i','','swatch');
-    input.type='checkbox';input.value=stat;input.checked=selectedChartStats.has(stat);swatch.style.background=color;
-    option.append(input,swatch,document.createTextNode(label));$('trend-stat-options').append(option);
-    input.addEventListener('change',()=>{
-        if(input.checked)selectedChartStats.add(stat);else selectedChartStats.delete(stat);
-        $('tooltip').hidden=true;performance(activeWindows()[selected]);
-    });
+    const option=text('label',''),input=document.createElement('input');input.type='checkbox';input.value=stat;input.checked=state.stats.has(stat);
+    option.append(input,key(color,true),document.createTextNode(label));$('trend-stat-options').append(option);
+    input.addEventListener('change',()=>{if(input.checked)state.stats.add(stat);else state.stats.delete(stat);performance(activeWindows()[state.window]);saveState()});
 }
+for(const [value,label] of [['tokens','Tokens'],['cost','Cost']]){const b=text('button',label);b.type='button';b.dataset.value=value;b.addEventListener('click',()=>{state.measure=value;syncMeasure();usage();saveState()});$('usage-metric').append(b)}
+const syncMeasure=()=>[...$('usage-metric').children].forEach(b=>b.setAttribute('aria-pressed',b.dataset.value===state.measure));
+for(const [value,label] of compareDims){const b=text('button',label);b.type='button';b.dataset.value=value;b.addEventListener('click',()=>{state.compare=value;syncCompare();comparison();saveState()});$('compare-dimension').append(b)}
+const syncCompare=()=>[...$('compare-dimension').children].forEach(b=>b.setAttribute('aria-pressed',b.dataset.value===state.compare));
+for(const [stat,label] of statDefs){const option=text('option',label);option.value=stat;$('comparison-stat-select').append(option)}
+$('comparison-stat-select').addEventListener('change',()=>{state.statistic=$('comparison-stat-select').value;comparison();saveState()});
+$('split-select').addEventListener('change',()=>{state.split=$('split-select').value;usage();saveState()});
 for(const id of ['trend-start','trend-end']){
-    const input=$(id);input.min=firstDate;input.max=cutoffDate;input.value=id==='trend-start'?trendStart:trendEnd;
+    const input=$(id);input.min=firstDate;input.max=cutoffDate;
     input.addEventListener('change',()=>{
         const start=$('trend-start'),end=$('trend-end'),error=$('trend-range-error');
         error.hidden=start.validity.valid&&end.validity.valid&&start.value<=end.value;
-        if(!error.hidden){error.textContent=`Choose dates from ${firstDate} to ${cutoffDate}, with Start on or before End.`;return}
-        trendStart=start.value;trendEnd=end.value;$('tooltip').hidden=true;performance(activeWindows()[selected]);
+        if(!error.hidden){error.textContent=`Choose dates from ${firstDate} to ${cutoffDate}, with From on or before To.`;return}
+        state.start=start.value;state.end=end.value;usage();performance(activeWindows()[state.window]);saveState();
     });
 }
-$('granularity-select').addEventListener('change',()=>{selectedGranularity=$('granularity-select').value;$('tooltip').hidden=true;performance(activeWindows()[selected]);});
-$('comparison-stat-select').value=selectedStatistic;
-$('comparison-stat-select').addEventListener('change',()=>{selectedStatistic=$('comparison-stat-select').value;tierComparison();modelComparison();});
-$('subtitle').textContent=`${number(data.files)} log files · ${number(data.threads)} threads · ${data.timezone}`;
-data.windows.forEach((w,i)=>{const b=text('button',w.label);b.type='button';b.setAttribute('aria-pressed',i===0);b.addEventListener('click',()=>selectWindow(i));$('tabs').append(b)});
-$('pricing-date').textContent=`Pricing: ${data.pricing_date}`;
-table($('diagnostics'),['Diagnostic','Count'],Object.entries(data.quality).map(([k,v])=>[k,number(v)]));data.warnings.forEach(w=>$('warnings').append(text('li',w)));
-function exactMetrics(){const rows=[];for(const w of activeWindows())for(const [key,title,unit] of metricDefs){const m=w.metrics[key];rows.push([`${w.label} · ${title} (${unit})`,displayMetric(key,m.avg),displayMetric(key,m.min),displayMetric(key,m.median),displayMetric(key,m.max),displayMetric(key,m.p75),displayMetric(key,m.p95),displayMetric(key,m.p99),number(m.count)])}table($('all-metrics'),['Window / metric','Average','Minimum','Median','Maximum','P75','P95','P99','Samples'],rows);}
-function modelComparison(){const entries=visibleModels();const rows=entries.map(([model,windows])=>{const w=windows[selected];return [model,number(w.conversations),comparisonMetric('ttft',w.metrics.ttft),comparisonMetric('throughput',w.metrics.throughput),comparisonMetric('length',w.metrics.length),comparisonMetric('tools',w.metrics.tools),number(w.total_tokens),money(w.cost)+(w.partial_cost?' (partial)':'')]});table($('model-comparison'),['Model','Conversations','First token (s)','Throughput (tokens/s)','Length (min)','Calls / conversation','Total tokens','Cost (USD)'],rows);[...$('model-comparison').querySelectorAll('tbody tr')].forEach((row,i)=>row.dataset.selected=entries[i][0]===selectedModel);$('comparison-caption').textContent=`${data.windows[selected].label} · ${comparisonLabel()} per metric · ${selectedTier||'All tiers'} · ${selectedMode||'All modes'} · models with recorded tokens in this window`;}
-function modelOptions(){const select=$('model-select');select.replaceChildren(text('option','All models'));select.firstChild.value='';const models=visibleModels().map(([model])=>model);for(const model of models){const option=text('option',model);option.value=model;select.append(option);}if(!models.includes(selectedModel))selectedModel='';select.value=selectedModel;}
-$('model-select').addEventListener('change',()=>{selectedModel=$('model-select').value;selectWindow(selected);});
-function modeOptions(){const select=$('mode-select');select.replaceChildren(text('option','All modes'));select.firstChild.value='';for(const mode of Object.keys(harnessGroup().by_mode)){const option=text('option',mode);option.value=mode;select.append(option);}if(!(selectedMode in harnessGroup().by_mode))selectedMode='';select.value=selectedMode;}
-modeOptions();
-$('mode-select').addEventListener('change',()=>{selectedMode=$('mode-select').value;selectWindow(selected);});
-function tierComparison(){const entries=Object.entries(harnessGroup().by_tier).map(([tier,group])=>{const scope=selectedMode?group.by_mode[selectedMode]:group;return [tier,(selectedModel?scope.by_model[selectedModel]:scope.windows)?.[selected]];}).filter(([,w])=>w);const rows=entries.map(([tier,w])=>[tier,number(w.conversations),comparisonMetric('ttft',w.metrics.ttft),comparisonMetric('throughput',w.metrics.throughput),comparisonMetric('length',w.metrics.length),comparisonMetric('tools',w.metrics.tools),number(w.total_tokens),money(w.cost)+(w.partial_cost?' (partial)':'')]);table($('tier-comparison'),['Tier','Conversations','First token (s)','Throughput (tokens/s)','Length (min)','Calls / conversation','Total tokens','Cost (USD)'],rows);[...$('tier-comparison').querySelectorAll('tbody tr')].forEach((row,i)=>row.dataset.selected=entries[i][0]===selectedTier);$('tier-caption').textContent=`${data.windows[selected].label} · ${comparisonLabel()} per metric · ${selectedMode||'All modes'} · ${selectedModel||'All models'} · all tiers`;}
-function tierOptions(){const select=$('tier-select');select.replaceChildren(text('option','All tiers'));select.firstChild.value='';for(const tier of Object.keys(harnessGroup().by_tier)){const option=text('option',tier);option.value=tier;select.append(option);}if(!(selectedTier in harnessGroup().by_tier))selectedTier='';select.value=selectedTier;}
-tierOptions();
-$('tier-select').addEventListener('change',()=>{selectedTier=$('tier-select').value;selectWindow(selected);});
+$('granularity-select').addEventListener('change',()=>{state.granularity=$('granularity-select').value;usage();performance(activeWindows()[state.window]);saveState()});
+$('expand-defs').addEventListener('click',()=>{const all=[...$('definitions').querySelectorAll('details')],open=!all.every(d=>d.open);all.forEach(d=>d.open=open);$('expand-defs').textContent=open?'Collapse all':'Expand all'});
+const themes=['system','light','dark'];let theme='system';try{theme=localStorage.getItem('harness-report-theme')||'system'}catch(error){}
+const applyTheme=()=>{if(theme==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=theme;$('theme-toggle').textContent=`Theme: ${theme[0].toUpperCase()+theme.slice(1)}`};
+$('theme-toggle').addEventListener('click',()=>{theme=themes[(themes.indexOf(theme)+1)%themes.length];try{localStorage.setItem('harness-report-theme',theme)}catch(error){}applyTheme()});applyTheme();
+addEventListener('scroll',hideTip,{passive:true});
+
+$('subtitle').textContent=`${integer(data.files)} log files · ${integer(data.threads)} threads · ${data.timezone} · cutoff ${fmtTime(data.generated)}`;
+$('pricing-date').textContent=`Pricing verified ${data.pricing_date}`;
+table($('diagnostics'),['Diagnostic','Count'],Object.entries(data.quality).map(([k,v])=>[k,integer(v)]),{empty:'No parser issues recorded.'});data.warnings.forEach(w=>$('warnings').append(text('li',w)));
 $('sources').append(document.createTextNode(`Rates verified ${data.pricing_date}: `));const link=text('a','OpenAI API pricing');link.href=data.pricing_source;link.rel='noreferrer';$('sources').append(link,document.createTextNode('. Rates are embedded in the script and are not updated automatically. Input directories: '+data.sources.join(', ')));
-const anthropicLink=text('a','Anthropic API pricing');anthropicLink.href=data.anthropic_pricing_source;anthropicLink.rel='noreferrer';$('sources').append(document.createTextNode(` · Anthropic verified ${data.anthropic_pricing_date}: `),anthropicLink);if(data.openrouter){const routerLink=text('a','OpenRouter model catalog');routerLink.href=data.openrouter.source;routerLink.rel='noreferrer';const origin=data.openrouter.bundled?' · bundled snapshot':data.openrouter.snapshot_file?' · supplied snapshot':' · live catalog';const date=data.openrouter.retrieved?` retrieved ${fmtTime(data.openrouter.retrieved)}`:' (retrieval date unknown)';const error=data.openrouter.error?` · live fetch unavailable: ${data.openrouter.error}; using bundled prices`:'';$('sources').append(document.createTextNode(' · '),routerLink,document.createTextNode(origin+date+error));}
+const anthropicLink=text('a','Anthropic API pricing');anthropicLink.href=data.anthropic_pricing_source;anthropicLink.rel='noreferrer';$('sources').append(document.createTextNode(` · Anthropic verified ${data.anthropic_pricing_date}: `),anthropicLink);if(data.openrouter){const routerLink=text('a','OpenRouter model catalog');routerLink.href=data.openrouter.source;routerLink.rel='noreferrer';const origin=data.openrouter.bundled?' · bundled snapshot':data.openrouter.snapshot_file?' · supplied snapshot':' · live catalog';const date=data.openrouter.retrieved?` retrieved ${fmtTime(data.openrouter.retrieved)}`:' (retrieval date unknown)';const error=data.openrouter.error?` · live fetch unavailable: ${data.openrouter.error}; using ${data.openrouter.bundled?'bundled':'supplied snapshot'} prices`:'';$('sources').append(document.createTextNode(' · '),routerLink,document.createTextNode(origin+date+error));}
 $('sources').append(document.createTextNode(' · '));const modeLink=text('a','Fast mode documentation');modeLink.href='https://developers.openai.com/api/docs/guides/fast-mode';modeLink.rel='noreferrer';$('sources').append(modeLink);
 $('footer').textContent=`Report cutoff: ${fmtTime(data.generated)} (${data.timezone})`;
-for(const harness of Object.keys(data.by_harness)){const option=text('option',harness);option.value=harness;$('harness-select').append(option);}
-$('harness-select').addEventListener('change',()=>{selectedHarness=$('harness-select').value;modeOptions();tierOptions();selectWindow(selected);});
-function recordedBilling(){const units=harnessGroup().windows[selected].recorded_billing;table($('recorded-billing'),['Recorded measurement','Amount'],Object.entries(units).map(([unit,amount])=>[unit,unit.endsWith('USD')?money(amount):number(amount)]));table($('router-prices'),['Model','OpenRouter ID','Input / MTok','Cache read / MTok','Output / MTok'],Object.entries(data.openrouter_rates).filter(([model])=>visibleModels().some(([name])=>name===model)).map(([model,r])=>[model,r.id,money(r.input),r.cached===null?'N/A':money(r.cached),money(r.output)]));}
-selectWindow(0);
-</script></body></html>'''
+
+loadState();
+$('trend-start').value=state.start;$('trend-end').value=state.end;$('granularity-select').value=state.granularity;$('split-select').value=state.split;$('comparison-stat-select').value=state.statistic;
+[...$('trend-stat-options').querySelectorAll('input')].forEach(i=>{i.checked=state.stats.has(i.value)});
+syncMeasure();syncCompare();render();
+</script></body></html>
+'''
 
 
 if __name__ == "__main__":

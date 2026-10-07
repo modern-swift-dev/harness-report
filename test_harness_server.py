@@ -1,8 +1,10 @@
 """Optional server tests: install requirements-server.txt, then run unittest discovery."""
-from contextlib import closing
+import asyncio
+from contextlib import closing, redirect_stderr
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import socket
@@ -127,6 +129,49 @@ class ServerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'could not be read'):
             self.service.refresh()
         self.assertEqual(self.service.current().metadata.snapshot, self.metadata.snapshot)
+
+    def test_startup_refresh_failure_serves_the_error_and_refresh_recovers(self):
+        path = self.root / 'invalid.sqlite'
+        path.write_text('not a SQLite database')
+        sources = {**self.sources, metrics.Harness.T3: [path]}
+        config = server.ServerConfig(sources, self.root / 'startup.sqlite3', timezone.utc, self.catalog,
+                                     {'source': metrics.OPENROUTER_SOURCE})
+        app = server.create_app(config)
+        service = app.state.service
+
+        async def start() -> None:
+            async with app.router.lifespan_context(app):
+                with self.assertRaises(server.HTTPException) as raised:
+                    service.current()
+                self.assertEqual(raised.exception.status_code, 503)
+                self.assertIn(str(path), raised.exception.detail)
+                del sources[metrics.Harness.T3]
+                metadata = service.refresh()
+                self.assertIsNone(service.startup_error)
+                self.assertEqual(service.current().metadata.snapshot, metadata.snapshot)
+
+        with redirect_stderr(io.StringIO()):
+            asyncio.run(start())
+
+    def test_external_commit_after_import_is_not_pinned_to_new_snapshot(self):
+        identity = self.service.database_identity
+        committed = []
+
+        def commit_then_identify():
+            if not committed:
+                committed.append(True)
+                with closing(sqlite3.connect(self.cache)) as connection, connection:
+                    connection.execute('UPDATE cache_turns SET duration=duration+1 WHERE completed=1')
+            return identity()
+
+        with patch.object(self.service, 'database_identity', side_effect=commit_then_identify):
+            with self.assertRaisesRegex(ValueError, 'changed during refresh'):
+                self.service.refresh()
+        with self.assertRaises(server.HTTPException) as raised:
+            self.service.current()
+        self.assertEqual(raised.exception.status_code, 409)
+        metadata = self.service.refresh()
+        self.assertEqual(self.service.current().metadata.snapshot, metadata.snapshot)
 
     def test_summary_and_combined_filters_match_static_report(self):
         report = self.static_report()

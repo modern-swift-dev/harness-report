@@ -64,6 +64,8 @@ class MetricSummary(BaseModel):
 
 class TrendPoint(MetricSummary):
     total_tokens: int
+    cost: str
+    partial_cost: bool
 
 
 class Period(BaseModel):
@@ -187,6 +189,7 @@ class DashboardService:
         self.config = config
         self.lock = RLock()
         self.snapshot: Snapshot | None = None
+        self.startup_error: str | None = None
         self.monitor: sqlite3.Connection | None = None
         self.trend_cache: OrderedDict[tuple[date, date, metrics.Granularity, str], TrendResponse] = OrderedDict()
         self.trend_cache_bytes = 0
@@ -206,7 +209,8 @@ class DashboardService:
     def current(self, identifier: str | None = None) -> Snapshot:
         snapshot = self.snapshot
         if snapshot is None:
-            raise HTTPException(503, "No dashboard snapshot is available. Refresh the sources.")
+            detail = f" Startup refresh failed: {self.startup_error}" if self.startup_error else ""
+            raise HTTPException(503, f"No dashboard snapshot is available. Refresh the sources.{detail}")
         if identifier is not None and identifier != snapshot.metadata.snapshot:
             raise HTTPException(409, "Snapshot changed. Reload the dashboard.")
         try:
@@ -221,22 +225,35 @@ class DashboardService:
     def refresh(self) -> Metadata:
         with self.lock:
             now = datetime.now(timezone.utc)
+            pinned: list[tuple[int, tuple[int, int]]] = []
+
+            def pin_version(writer: sqlite3.Connection) -> None:
+                # The writer's data_version changes only for other connections' commits, so an
+                # unchanged value around the monitor read proves it observed exactly this import.
+                before = writer.execute("PRAGMA data_version").fetchone()[0]
+                if self.monitor is None or (self.snapshot is not None
+                                            and self.database_identity() != self.snapshot.file_identity):
+                    self.close()
+                    self.monitor = sqlite3.connect(self.config.cache_path.resolve().as_uri() + "?mode=ro",
+                                                   uri=True, check_same_thread=False)
+                pinned.append((self.monitor.execute("PRAGMA data_version").fetchone()[0], self.database_identity()))
+                if writer.execute("PRAGMA data_version").fetchone()[0] != before:
+                    raise ValueError("The database changed during refresh. Retry Refresh.")
+
             # Compute before the importer commits, so failed recalculation rolls back its updates.
             with metrics.prepare_sources(self.config.sources, metrics.Quality(), True,
-                                         self.config.cache_path, now) as prepared:
-                if prepared.uncached_groups:
-                    raise ValueError("Some sources changed or could not be read and were not cached. "
+                                         self.config.cache_path, now, after_commit=pin_version) as prepared:
+                if prepared.uncached_sources:
+                    shown = ", ".join(prepared.uncached_sources[:3])
+                    more = len(prepared.uncached_sources) - 3
+                    raise ValueError("Some sources changed or could not be read and were not cached: "
+                                     f"{shown}{f' and {more:,} more' if more > 0 else ''}. "
                                      "Check source access and retry Refresh; the previous snapshot is retained.")
                 print("Calculating summaries for all cached conversations…", file=sys.stderr)
                 candidate = self.calculate_snapshot(prepared.cache, now)
-            if self.monitor is None or (self.snapshot is not None
-                                        and self.database_identity() != self.snapshot.file_identity):
-                self.close()
-                self.monitor = sqlite3.connect(self.config.cache_path.resolve().as_uri() + "?mode=ro",
-                                               uri=True, check_same_thread=False)
-            candidate.database_version = self.monitor.execute("PRAGMA data_version").fetchone()[0]
-            candidate.file_identity = self.database_identity()
+            candidate.database_version, candidate.file_identity = pinned[0]
             self.snapshot = candidate
+            self.startup_error = None
             self.trend_cache.clear()
             self.trend_cache_bytes = 0
             return candidate.metadata
@@ -417,7 +434,12 @@ def create_app(config: ServerConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
-            await run_in_threadpool(service.refresh)
+            try:
+                await run_in_threadpool(service.refresh)
+            except (OSError, sqlite3.Error, ValueError) as error:
+                # Serve the dashboard so the failure is visible and Refresh can retry it.
+                service.startup_error = str(error)
+                print(f"Initial refresh failed: {error}", file=sys.stderr)
             yield
         finally:
             service.close()

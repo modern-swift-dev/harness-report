@@ -158,6 +158,23 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(r["windows"][0]["total_tokens"], 2200)
         self.assertGreater(r["quality"]["Inherited records excluded"], 0)
 
+    def test_inherited_cumulative_counters_set_the_fork_baseline(self):
+        parent = prefix() + [legacy(usage(10_000, 1_000)), complete()]
+        child_turn = [event("task_started", turn_id="child-turn"),
+                      record("turn_context", {"turn_id": "child-turn", "model": "gpt-6.1-sol"}),
+                      legacy(usage(11_000, 1_100), last=usage(1_000, 100)), complete("child-turn")]
+        variants = {
+            "ordinal": [record("session_meta", {"id": "child", "forked_from_id": "root",
+                                                "subagent_history_start_ordinal": len(parent) + 1})] + parent + child_turn,
+            "copied metadata": [record("session_meta", {"id": "child"})] + parent + [
+                event("thread_settings_applied", thread_id="child", thread_settings={"model": "gpt-6.1-sol"})] + child_turn,
+        }
+        for name, rows in variants.items():
+            with self.subTest(name):
+                self.write(rows, "logs/child.jsonl")
+                w = self.report()["windows"][0]
+                self.assertEqual(w["total_tokens"], 1_100)
+
     def test_copied_parent_metadata_without_boundary(self):
         self.write([record("session_meta", {"id": "child"})] + prefix() + [modern(), complete(),
                    event("thread_settings_applied", thread_id="child", thread_settings={"model": "gpt-6.1-sol"}),
@@ -312,12 +329,27 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(metrics.main(), 0)
         report = json.loads(output.read_text().split('id="report-data">')[1].split('</script>')[0])
         self.assertEqual(set(report["by_harness"]), {"codex", "claude"})
-        self.assertEqual(report["files"], 3)
-        self.assertEqual(report["windows"][0]["total_tokens"], 2310)
+        # The working directory holds a decoy log that is not an implicit archive.
+        self.assertEqual(report["files"], 2)
+        self.assertEqual(report["windows"][0]["total_tokens"], 1210)
+
+    def test_cli_without_directory_or_installed_codex_ignores_working_directory_logs(self):
+        working = self.root / "working"
+        working.mkdir()
+        self.write(prefix(thread="decoy") + [modern(), complete()], "working/decoy.jsonl")
+        output = self.root / "report.html"
+        with patch("harness_metrics.Path.home", return_value=self.root / "home"), \
+             patch("harness_metrics.Path.cwd", return_value=working), \
+             patch("sys.argv", ["harness_metrics.py", "--offline", "--no-cache", "--output", str(output)]), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(metrics.main(), 0)
+        report = json.loads(output.read_text().split('id="report-data">')[1].split('</script>')[0])
+        self.assertEqual((report["files"], report["threads"], report["sources"]), (0, 0, []))
 
     def test_cli_default_codex_includes_archived_sessions_and_deduplicates_copies(self):
         working = self.root / "working"
         working.mkdir()
+        self.write(prefix(thread="decoy") + [modern(response="decoy"), complete()], "working/decoy.jsonl")
         live = prefix(thread="live") + [modern(response="live"), complete()]
         self.write(live, "home/.codex/sessions/live.jsonl")
         self.write(live, "home/.codex/archived_sessions/copy.jsonl")
@@ -330,8 +362,7 @@ class ReportTests(unittest.TestCase):
              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(metrics.main(), 0)
         report = json.loads(output.read_text().split('id="report-data">')[1].split('</script>')[0])
-        self.assertEqual(report["sources"], [str(working.resolve()),
-                         str((self.root / "home/.codex/sessions").resolve()),
+        self.assertEqual(report["sources"], [str((self.root / "home/.codex/sessions").resolve()),
                          str((self.root / "home/.codex/archived_sessions").resolve())])
         self.assertEqual(report["files"], 3)
         self.assertEqual(report["threads"], 2)
@@ -350,10 +381,20 @@ class ReportTests(unittest.TestCase):
              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(metrics.main(), 0)
         report = json.loads(output.read_text().split('id="report-data">')[1].split('</script>')[0])
-        self.assertEqual(report["sources"], [str(working.resolve()),
-                         str((self.root / "home/.codex/archived_sessions").resolve())])
+        self.assertEqual(report["sources"], [str((self.root / "home/.codex/archived_sessions").resolve())])
         self.assertEqual(report["files"], 1)
         self.assertEqual(report["windows"][0]["total_tokens"], 1100)
+
+    def test_codex_invalid_utf8_line_is_skipped_without_losing_usage(self):
+        path = self.root / "logs/session.jsonl"
+        path.parent.mkdir(parents=True)
+        rows = [json.dumps(r).encode() for r in prefix() + [modern(), complete()]]
+        path.write_bytes(b"\n".join(rows[:2] + [b"\xff\xfe broken"] + rows[2:]) + b"\n")
+        with redirect_stderr(io.StringIO()):
+            r = self.report()
+        self.assertEqual(r["windows"][0]["total_tokens"], 1100)
+        self.assertEqual(r["quality"]["Malformed lines"], 1)
+        self.assertNotIn("Unreadable files", r["quality"])
 
     def test_malformed_nested_codex_fields_are_skipped_without_losing_usage(self):
         bad_records = [
@@ -775,6 +816,33 @@ class ReportTests(unittest.TestCase):
         self.assertIsNone(daily["2026-10-01"])
         self.assertEqual(daily["2026-10-03"]["total_tokens"], 140)
         self.assertEqual(daily["2026-10-03"]["ttft"]["count"], 0)
+
+    def test_trend_costs_match_window_costs_and_flag_unpriced_periods(self):
+        cutoff = datetime(2026, 10, 3, 12, tzinfo=timezone.utc)
+        events = [metrics.UsageEvent(at, metrics.Usage(100, 40, cached=20, reasoning=10, write=15),
+                                    model, str(index), mode=mode)
+                  for index, (at, model, mode) in enumerate([
+                      (cutoff - timedelta(days=3), "gpt-6.1-sol", metrics.SpeedMode.NORMAL),
+                      (cutoff - timedelta(days=1), "gpt-6-astra", metrics.SpeedMode.FAST),
+                      (cutoff - timedelta(hours=2), "unknown-model", metrics.SpeedMode.NORMAL),
+                      (cutoff, "gpt-6.1-sol", metrics.SpeedMode.NORMAL)])]
+        turn = metrics.Turn("unfinished", start=events[0].at, model="gpt-6.1-sol", modern=events)
+        report = metrics.build_breakdown([metrics.Thread("one", turns={turn.id: turn})],
+                                         cutoff, report_zone=timezone.utc)
+        scopes = {"all": (report["windows"], report["trends"]),
+                  "fast": (report["by_mode"]["Fast"]["windows"], report["by_mode"]["Fast"]["trends"]),
+                  "model": (report["by_model"]["gpt-6.1-sol"], report["by_model_trends"]["gpt-6.1-sol"])}
+        for name, (windows, trends) in scopes.items():
+            for interval in metrics.Granularity:
+                with self.subTest(scope=name, interval=interval.value):
+                    points = [p for p in trends[interval.value] if p]
+                    self.assertEqual(sum((Decimal(p["cost"]) for p in points), Decimal(0)),
+                                     Decimal(windows[-1]["cost"]))
+        self.assertGreater(Decimal(report["by_mode"]["Fast"]["windows"][-1]["cost"]), 0)
+        daily = dict(zip((p["label"] for p in report["trend_periods"]["daily"]), report["trends"]["daily"]))
+        self.assertTrue(daily["2026-10-03"]["partial_cost"])
+        self.assertFalse(daily["2026-09-30"]["partial_cost"])
+        self.assertGreater(Decimal(daily["2026-09-30"]["cost"]), 0)
 
     def test_hourly_trends_preserve_dst_skipped_and_repeated_hours(self):
         try:
@@ -1259,6 +1327,7 @@ class ReportTests(unittest.TestCase):
         expected = {"gpt-5.6-luna": "Budget", "gpt-6-luna": "Budget", "gpt-5.6-terra": "Budget",
                     "gpt-5.4-mini": "Budget", "gpt-5.3-codex-spark": "Budget", "codex-auto-review": "Budget",
                     "gpt-5.6-sol": "Medium", "gpt-6-sol": "Medium", "gpt-6.1-sol": "Medium",
+                    "gpt-5.4-nano": "Budget", "gpt-5-mini": "Budget", "gpt-5-nano": "Budget",
                     "gpt-5.4": "Medium", "gpt-5.5": "Medium", "gpt-6-astra": "High",
                     None: "Unclassified", "unpublished-model": "Unclassified", "gpt-5.4-pro": "Unclassified"}
         for model, tier in expected.items():
@@ -1390,6 +1459,24 @@ class CacheTests(unittest.TestCase):
     def report(self, **kwargs):
         return metrics.collect_report(self.root, NOW, cache_path=self.cache, **kwargs)
 
+    def test_failed_report_keeps_checkpointed_groups_but_server_style_failure_rolls_back(self):
+        for name in ("one", "two", "three"):
+            self.write(f"{name}.jsonl", prefix(thread=name) + [modern(), complete()])
+        def cached_groups():
+            with closing(sqlite3.connect(self.cache)) as connection:
+                return connection.execute("SELECT count(*) FROM cache_groups").fetchone()[0]
+        with patch("harness_metrics.CHECKPOINT_GROUPS", 2), \
+             patch("harness_metrics.add_thread", side_effect=ValueError("report failed")):
+            with self.assertRaises(ValueError):
+                self.report()
+        self.assertEqual(cached_groups(), 2)
+        self.cache.unlink()
+        with self.assertRaises(ValueError):
+            with metrics.prepare_sources({metrics.Harness.CODEX: [self.root]}, metrics.Quality(), False,
+                                         self.cache, NOW):
+                raise ValueError("caller failed")
+        self.assertEqual(cached_groups(), 0)
+
     def test_cache_skips_parsing_and_identity_reads_and_appends_new_conversations(self):
         self.write("one.jsonl", prefix(thread="one") + [modern(), complete()])
         expected = metrics.collect_report(self.root, NOW)
@@ -1496,6 +1583,32 @@ class CacheTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=1")
         original = self.cache.read_bytes()
         with self.assertRaisesRegex(ValueError, "different database"):
+            self.report()
+        self.assertEqual(self.cache.read_bytes(), original)
+
+    def test_outdated_cache_version_is_rebuilt_from_sources(self):
+        self.write("one.jsonl", prefix(thread="one") + [modern(), complete()])
+        expected = self.report()
+        with closing(sqlite3.connect(self.cache)) as connection, connection:
+            connection.execute("UPDATE cache_usage SET input='999999'")
+            connection.execute(f"PRAGMA user_version={metrics.CACHE_VERSION - 1}")
+        with closing(sqlite3.connect(self.cache)) as connection:
+            with self.assertRaisesRegex(ValueError, "older parser"):
+                metrics.MetricsReader(connection)
+        with patch("harness_metrics.read_thread", wraps=metrics.read_thread) as read:
+            self.assertEqual(self.report(), expected)
+            self.assertEqual(read.call_count, 1)
+        with closing(sqlite3.connect(self.cache)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], metrics.CACHE_VERSION)
+
+    def test_outdated_version_with_foreign_tables_is_not_dropped(self):
+        self.write("one.jsonl", prefix(thread="one") + [modern(), complete()])
+        self.report()
+        with closing(sqlite3.connect(self.cache)) as connection, connection:
+            connection.execute("CREATE TABLE unrelated (value TEXT)")
+            connection.execute(f"PRAGMA user_version={metrics.CACHE_VERSION - 1}")
+        original = self.cache.read_bytes()
+        with self.assertRaisesRegex(ValueError, "older parser"):
             self.report()
         self.assertEqual(self.cache.read_bytes(), original)
 
@@ -1798,6 +1911,71 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(r["windows"][0]["total_tokens"], 0)
         self.assertEqual(r["quality"]["Invalid usage records"], 2)
 
+    def test_claude_malformed_type_and_stop_reason_are_skipped(self):
+        bad_stop = self.claude(request="r2", message="m2")
+        bad_stop["message"]["stop_reason"] = ["end_turn"]
+        rows = [{"type": ["assistant"], "timestamp": START.isoformat()}, bad_stop, self.claude()]
+        self.write(rows, "claude/session.jsonl")
+        r = self.report({metrics.Harness.CLAUDE: [self.root / "claude"]})
+        self.assertEqual(r["windows"][0]["total_tokens"], 1_600)
+
+    def test_claude_invalid_usage_still_completes_the_turn(self):
+        user = {"type": "user", "uuid": "u1", "sessionId": "same-id", "timestamp": START.isoformat(),
+                "message": {"role": "user", "content": "hello"}}
+        final = self.claude(request="r2", message="m2", at=START + timedelta(seconds=5))
+        final["message"]["usage"] = {"input_tokens": -1}
+        self.write([user, final], "claude/session.jsonl")
+        with redirect_stderr(io.StringIO()):
+            r = self.report({metrics.Harness.CLAUDE: [self.root / "claude"]})
+        self.assertEqual(r["quality"]["Invalid usage records"], 1)
+        self.assertEqual(r["windows"][0]["coverage"]["Completed turns"], 1)
+        self.assertNotIn("Unfinished turns", r["windows"][0]["coverage"])
+
+    def test_session_identity_tolerates_invalid_utf8_after_first_record(self):
+        path = self.root / "codex/invalid.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(json.dumps(record("session_meta", {"id": "real-id"})).encode() + b"\n\xff\xfe bad\n")
+        self.assertEqual(metrics.session_identity(path, metrics.Harness.CODEX), "real-id")
+
+    def test_harness_filter_excludes_t3_threads_from_shared_opencode_group(self):
+        db = self.opencode_db()
+        with closing(sqlite3.connect(db)) as connection, connection:
+            row = connection.execute("SELECT data FROM message WHERE id='m1'").fetchone()
+            connection.execute("INSERT INTO message VALUES (?, ?, ?)", ("m2", "native-only", row[0]))
+        sources = {metrics.Harness.OPENCODE: [db], metrics.Harness.T3: [self.t3_db((("opencode", "same-id"),))]}
+        cache = self.root / "cache.sqlite3"
+        metrics.collect_report(self.root / "codex", NOW, harness_roots=sources, cache_path=cache)
+        with closing(sqlite3.connect(cache)) as connection:
+            reader = metrics.MetricsReader(connection)
+            for harness in (metrics.Harness.OPENCODE, metrics.Harness.T3):
+                with self.subTest(harness):
+                    threads = list(reader.threads(metrics.Quality(), harness))
+                    self.assertEqual({thread.harness for thread in threads}, {harness})
+                    self.assertEqual(len(threads), 1)
+
+    def test_claude_invalid_utf8_line_is_skipped_without_losing_usage(self):
+        path = self.root / "claude/session.jsonl"
+        path.parent.mkdir(parents=True)
+        first, last = self.claude(request="r1", message="m1"), self.claude(request="r2", message="m2")
+        path.write_bytes(json.dumps(first).encode() + b"\n\xff\xfe broken\n" + json.dumps(last).encode() + b"\n")
+        with redirect_stderr(io.StringIO()):
+            r = self.report({metrics.Harness.CLAUDE: [self.root / "claude"]})
+        self.assertEqual(r["windows"][0]["total_tokens"], 1600)
+        self.assertEqual(r["quality"]["Malformed lines"], 1)
+        self.assertNotIn("Unreadable files", r["quality"])
+
+    def test_claude_synthetic_messages_do_not_affect_models_or_usage_counts(self):
+        synthetic = self.claude(request="synthetic", message="synthetic")
+        synthetic["message"].update(model="<synthetic>", usage={"input_tokens": 0, "output_tokens": 0},
+                                    content=[{"type": "text", "text": "API Error"}])
+        self.write([self.claude(), synthetic], "claude/session.jsonl")
+        r = self.report({metrics.Harness.CLAUDE: [self.root / "claude"]})
+        w = r["windows"][0]
+        self.assertEqual(w["total_tokens"], 800)
+        self.assertEqual(w["coverage"]["Usage responses"], 1)
+        self.assertEqual(list(w["models"]), ["claude-sonnet-4-6"])
+        self.assertNotIn("<synthetic>", metrics.render_report(r))
+
     def test_copilot_per_response_usage_ignores_shutdown_double_count(self):
         usage_data = {"model": "claude-sonnet-4.6", "inputTokens": 700, "outputTokens": 100,
                       "cacheReadTokens": 400, "cacheWriteTokens": 200, "reasoningTokens": 20,
@@ -1855,6 +2033,22 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(r["windows"][0]["total_tokens"], 2200)
         self.assertEqual(Decimal(r["windows"][0]["cost"]), Decimal(".00448"))
         self.assertEqual(r["windows"][0]["coverage"]["Aggregate snapshots"], 1)
+
+    def test_copilot_shutdown_billing_counts_models_without_detailed_usage(self):
+        detailed = {"model": "gpt-6.1-sol", "inputTokens": 1000, "outputTokens": 100, "cost": 1,
+                    "copilotUsage": {"totalNanoAiu": 500}}
+        summary = {"modelMetrics": {
+            "gpt-6.1-sol": {"usage": {"inputTokens": 1000, "outputTokens": 100}, "totalNanoAiu": 500,
+                            "requests": {"cost": 1}},
+            "claude-sonnet-4.6": {"usage": {"inputTokens": 300, "outputTokens": 30}, "totalNanoAiu": 700,
+                                  "requests": {"cost": 2}}}}
+        self.write([self.copilot("session.start", "s", {"sessionId": "same-id"}),
+                    self.copilot("assistant.usage", "u", detailed),
+                    self.copilot("session.shutdown", "end", summary)], "copilot/events.jsonl")
+        r = self.report({metrics.Harness.COPILOT: [self.root / "copilot"]})
+        self.assertEqual(r["windows"][0]["total_tokens"], 1430)
+        self.assertEqual(r["windows"][0]["recorded_billing"],
+                         {"Copilot nano-AIU": "1200", "Copilot premium requests": "3"})
 
     def test_copilot_large_shutdown_totals_use_normal_context_rates(self):
         for has_detailed_usage, expected in [(False, ".7506"), (True, "1.0012")]:

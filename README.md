@@ -28,13 +28,13 @@ The CLI maintains a SQLite cache at `~/.cache/harness-report/metrics.sqlite3` (o
 
 The cache contains normalized usage, timing, calls, billing, and parser diagnostics, without message text or tool arguments. Prices, timezones, and the report cutoff are applied when generating each report, so changing them does not require reimporting logs. Reports include only the currently selected source files; unrelated or removed sources retained in the cache are excluded. OpenCode cache invalidation includes its SQLite WAL file; a changed OpenCode database is refreshed as a whole.
 
-Use `--cache /path/to/metrics.sqlite3` to choose a separate cache database, or `--no-cache` to reparse sources without persistent caching. A temporary SQLite working database keeps memory bounded when persistent caching is disabled and is removed after generation. Keep the cache separate from harness databases. The cache is disposable: if its version is incompatible, use a new cache path or bypass it. Source logs remain read-only. Progress output shows how many conversations were cached or parsed.
+Use `--cache /path/to/metrics.sqlite3` to choose a separate cache database, or `--no-cache` to reparse sources without persistent caching. A temporary SQLite working database keeps memory bounded when persistent caching is disabled and is removed after generation. Keep the cache separate from harness databases. The cache is disposable: a cache written by an older parser version is cleared and rebuilt from the sources on the next import. A cache from a newer version, or a database containing other tables, is rejected unchanged; use a new cache path or bypass it. Source logs remain read-only. Progress output shows how many conversations were cached or parsed.
 
-Without a directory argument, the script scans the current directory for Codex JSONL logs and discovers these installed sources when present:
+Without a directory argument, the script discovers these installed sources when present. The current directory is not scanned:
 
 | Harness | Default source |
 | --- | --- |
-| Codex | `~/.codex/sessions` and `~/.codex/archived_sessions`, plus the current directory |
+| Codex | `~/.codex/sessions` and `~/.codex/archived_sessions` |
 | Claude Code | `~/.claude/projects` |
 | Copilot CLI | `~/.copilot/session-state` |
 | OpenCode | `~/.local/share/opencode/opencode.db` |
@@ -66,7 +66,7 @@ Open [http://localhost:3050](http://localhost:3050). The server binds to `127.0.
 
 The dashboard HTML is approximately 50 KB, with no embedded metrics. It preserves the static report's controls, charts, comparisons, and data-quality sections. The browser requests summaries for the current filters and one chart series for the chosen dates and interval. The server calculates reporting summaries once per refresh and keeps a bounded cache of requested chart series. Startup and refresh can take tens of seconds for large databases; later view requests reuse those summaries.
 
-Startup imports configured sources into the persistent cache without generating a static report. **Refresh sources** repeats the import and recalculates summaries; controls pause until it finishes. There is no automatic polling. Failed refreshes retain the previous snapshot. Sources that change while being read or cannot be imported cause a refresh error; check access and retry. Malformed individual records are skipped with diagnostics while valid usage is retained.
+Startup imports configured sources into the persistent cache without generating a static report. **Refresh sources** repeats the import and recalculates summaries; controls pause until it finishes. There is no automatic polling. Failed refreshes retain the previous snapshot. Sources that change while being read or cannot be imported cause a refresh error that names the affected files; check access and retry. If the startup import fails, the server still starts and the dashboard shows the error until a refresh succeeds. Malformed individual records are skipped with diagnostics while valid usage is retained.
 
 The dashboard includes **every conversation retained in the chosen metrics database**, including cached sources that no longer exist. Source arguments and `--harness` select what to import during refresh; use the dashboard filters to control what is displayed. Changing source options does not remove older cached conversations. Choose a separate `--cache` path to isolate an archive.
 
@@ -78,7 +78,7 @@ python3 harness_server.py --harness claude --claude-dir /path/to/claude-projects
 python3 harness_server.py --help
 ```
 
-The server requires persistent caching and does not accept `--no-cache` or `--output`. Rates are selected at startup and stay fixed until restart. Changes made by another importer are detected; use Refresh to load a consistent snapshot. API reads access SQLite read-only; imports update only the metrics cache, never harness storage. The cache must remain separate from harness databases.
+The server requires persistent caching and does not accept `--no-cache` or `--output`. Rates are selected at startup and stay fixed until restart. Changes made by another importer are detected, including commits that land while a refresh completes; use Refresh to load a consistent snapshot. API reads access SQLite read-only; imports update only the metrics cache, never harness storage. The cache must remain separate from harness databases.
 
 The local REST API provides:
 
