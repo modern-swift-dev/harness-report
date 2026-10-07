@@ -456,6 +456,8 @@ class Turn:
     mode: SpeedMode = SpeedMode.NORMAL
     completed: bool = False
     aborted: bool = False
+    # Timing-only output count for harnesses that persist no per-response usage.
+    output_tokens: int | None = None
     modern: list[UsageEvent] = field(default_factory=list)
     legacy: list[UsageEvent] = field(default_factory=list)
 
@@ -822,6 +824,9 @@ def add_billing(thread: Thread, at: datetime, unit: str, value: Any) -> None:
 def read_copilot(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
     thread = Thread(thread_id, harness=Harness.COPILOT)
     current_turn, model = "unattributed", None
+    # Loop turn IDs restart per interaction and repeat across subagents; map them to the latest start.
+    active: dict[tuple[str, str], str] = {}
+    message_outputs: dict[tuple[str, str], int] = {}
     seen: set[str] = set()
     seen_responses: set[str] = set()
     summaries: dict[str, tuple[datetime, dict[str, Any]]] = {}
@@ -858,10 +863,17 @@ def read_copilot(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
                         if isinstance(metric, dict):
                             summaries[name] = (at, metric)
                 continue
+            scope, raw_turn = str(row.get("agentId") or data.get("parentToolCallId") or ""), data.get("turnId")
             if kind == "assistant.turn_start":
-                current_turn = str(data.get("turnId") or key)
+                current_turn = key
+                if raw_turn is not None:
+                    active[(scope, str(raw_turn))] = key
                 model = data.get("model") or model
-            turn_id = str(data.get("turnId") or current_turn)
+                turn_id = key
+            elif raw_turn is not None:
+                turn_id = active.get((scope, str(raw_turn)), str(raw_turn))
+            else:
+                turn_id = current_turn
             turn = thread.turns.setdefault(turn_id, Turn(turn_id, model=model))
             if kind == "assistant.turn_start":
                 turn.start = at
@@ -871,6 +883,15 @@ def read_copilot(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
                     turn.duration = (at - turn.start).total_seconds()
             elif kind in {"abort", "agent.interrupted"}:
                 turn.end, turn.aborted, turn.completed = at, True, False
+            elif kind == "assistant.message":
+                # assistant.usage is ephemeral; each chunk of a persisted message repeats its call's completion tokens.
+                output = data.get("outputTokens")
+                if isinstance(output, int) and not isinstance(output, bool) and output >= 0:
+                    call = (turn_id, str(data.get("apiCallId") or data.get("requestId") or data.get("messageId") or key))
+                    previous = message_outputs.get(call, 0)
+                    message_outputs[call] = max(previous, output)
+                    turn.output_tokens = (turn.output_tokens or 0) + message_outputs[call] - previous
+                    turn.model = data.get("model") or turn.model
             elif kind == "tool.execution_start":
                 call_id = str(data.get("toolCallId") or key)
                 thread.calls.setdefault(call_id, ToolCall(at, turn_id, model))
@@ -1298,8 +1319,8 @@ def add_thread(windows: list[Window], thread: Thread,
                 window.durations[thread.id] = window.durations.get(thread.id, 0) + turn.duration
             else:
                 window.coverage["Missing turn duration"] += 1
-            if turn.duration and usage_events:
-                output = sum(r.usage.output for r in usage_events)
+            output = sum(r.usage.output for r in usage_events) if usage_events else turn.output_tokens
+            if turn.duration and output is not None:
                 window.throughput.append(output / turn.duration)
             else:
                 window.coverage["Missing throughput samples"] += 1
@@ -1468,7 +1489,7 @@ def session_identity(path: Path, harness: Harness) -> str:
 CHECKPOINT_GROUPS = 250
 
 # Bump when the schema or parser semantics change; cached facts must match the readers.
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 # Children precede parents so older caches can be dropped with foreign keys enabled.
 CACHE_TABLES = ("cache_billing", "cache_calls", "cache_usage", "cache_turns", "cache_threads",
@@ -1551,13 +1572,14 @@ class MetricsReader:
         threads = {thread_id: Thread(thread_id, harness=Harness(harness)) for thread_id, harness in
                    self.connection.execute("SELECT thread_id, harness FROM cache_threads WHERE cache_key=? ORDER BY rowid", (key,))}
         for row in self.connection.execute(
-                "SELECT thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted "
+                "SELECT thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted, output_tokens "
                 "FROM cache_turns WHERE cache_key=? ORDER BY rowid", (key,)):
-            thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted = row
+            thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted, output_tokens = row
             threads[thread_id].turns[turn_id] = Turn(
                 turn_id, start=datetime.fromisoformat(start) if start else None,
                 end=datetime.fromisoformat(end) if end else None, duration=duration, ttft=ttft,
-                model=model, mode=SpeedMode(mode), completed=bool(completed), aborted=bool(aborted))
+                model=model, mode=SpeedMode(mode), completed=bool(completed), aborted=bool(aborted),
+                output_tokens=output_tokens)
         for row in self.connection.execute(
                 "SELECT thread_id, turn_id, at, model, event_key, mode, aggregate, input, output, cached, "
                 "reasoning, cache_write, write_hour FROM cache_usage WHERE cache_key=? ORDER BY rowid", (key,)):
@@ -1595,7 +1617,7 @@ class MetricsCache(MetricsReader):
             CREATE TABLE IF NOT EXISTS cache_turns (
                 cache_key TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT NOT NULL,
                 start TEXT, end TEXT, duration REAL, ttft REAL, model TEXT, mode TEXT NOT NULL,
-                completed INTEGER NOT NULL, aborted INTEGER NOT NULL,
+                completed INTEGER NOT NULL, aborted INTEGER NOT NULL, output_tokens INTEGER,
                 PRIMARY KEY (cache_key, thread_id, turn_id),
                 FOREIGN KEY (cache_key, thread_id) REFERENCES cache_threads ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS cache_usage (
@@ -1661,10 +1683,10 @@ class MetricsCache(MetricsReader):
         for thread in threads:
             self.connection.execute("INSERT INTO cache_threads VALUES (?, ?, ?)",
                                     (key, thread.id, thread.harness.value))
-            self.connection.executemany("INSERT INTO cache_turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+            self.connection.executemany("INSERT INTO cache_turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
                 (key, thread.id, turn.id, turn.start.isoformat() if turn.start else None,
                  turn.end.isoformat() if turn.end else None, turn.duration, turn.ttft, turn.model,
-                 turn.mode.value, turn.completed, turn.aborted) for turn in thread.turns.values()])
+                 turn.mode.value, turn.completed, turn.aborted, turn.output_tokens) for turn in thread.turns.values()])
             self.connection.executemany("INSERT INTO cache_usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
                 (key, thread.id, turn.id, i, record.at.isoformat(), record.model, record.key,
                  record.mode.value, record.aggregate, str(record.usage.input), str(record.usage.output),
@@ -2252,7 +2274,7 @@ noscript{display:block;padding:20px;background:var(--warn-bg)}
 <details><summary>Model attribution</summary><p>Fast usage has a separate model entry with a “-fast” suffix. Requests crossing a published context-pricing threshold have a “-long” suffix, including cached input when selecting the threshold; combined usage has “-fast-long”. Usage below the threshold keeps the model name unless Fast. Models without context pricing and aggregate records without per-request sizes do not receive “-long”. Tokens, calls, timing, and costs are separated by recorded mode, with the Fast premium applied to the underlying model's rates. Tokens and calls use their recorded model, falling back to the turn model. Timing uses the model generating that turn. Conversation duration and tool counts include only that model's activity; a thread using multiple models or modes appears in each, so conversation counts are not additive. If several models generate output within one turn, its timing is listed under “Mixed models (timing)”. If one model uses several modes within a turn, its timing is listed under “Mixed modes (timing)” because separate durations cannot be recovered. If one model in one mode crosses context thresholds within a turn, its timing is listed under “Mixed contexts (timing)”. Tool calls follow the context class of matching model and mode usage in their turn; ambiguous calls are listed under “Mixed contexts (tools)”. Mode and tier totals retain this activity once. When the usage chart is split by model, models beyond the seven with the most tokens across the report share the “Other” color, and are combined when several appear together.</p></details>
 <details><summary>Model tiers</summary><p>Budget: Luna, Terra, GPT mini and nano models, Spark, codex-auto-review, and Claude Haiku. Medium: Sol, GPT-5.4, GPT-5.5, and Claude Sonnet. High: Astra, Claude Opus, Fable, and Mythos. Models outside these groups are Unclassified. Tier metrics are calculated from underlying activity, with each conversation counted once per tier. Turns using several models in the same tier retain their timing in that tier; turns spanning tiers have timing under “Mixed tiers (timing)”. Per-model pricing and the Fast premium still apply. The model selector and comparison table show entries with recorded tokens in the selected window, harness, tier, and mode. Zero-token entries, including shared timing and tool-call buckets, remain included in aggregate totals and coverage.</p></details>
 <details><summary>Mode attribution</summary><p>Logged service tier “default” is Normal; “priority” or “fast” is Fast. Settings persist until changed. Per the selected assumption, unknown mode—including missing evidence, explicit null, and “auto”—is counted as Normal in all metrics and costs. Other explicit tiers have their own bucket. Tokens and calls follow their recorded tier or the latest logged settings. This combines logged mode with the Normal assumption; a backend fallback cannot be detected without a response tier. A turn with usage in several modes has its timing under “Mixed modes (timing)” because separate durations are unavailable. Conversation durations and calls include only activity attributed to the selected mode.</p></details>
-<details><summary>Harness coverage</summary><p>Claude Code reads project JSONL files, Copilot reads CLI session events, and OpenCode reads its message and tool tables. T3 Code links saved native sessions to the Codex, Claude Code, and OpenCode readers; linked sessions count once under T3 when selected. Missing native logs and other T3 providers are outside coverage. Copilot shutdown-only totals are assigned to shutdown, which does not establish when individual requests occurred. Timing samples require logged timing evidence.</p></details>
+<details><summary>Harness coverage</summary><p>Claude Code reads project JSONL files, Copilot reads CLI session events, and OpenCode reads its message and tool tables. T3 Code links saved native sessions to the Codex, Claude Code, and OpenCode readers; linked sessions count once under T3 when selected. Missing native logs and other T3 providers are outside coverage. Copilot shutdown-only totals are assigned to shutdown, which does not establish when individual requests occurred. Copilot does not persist per-request usage, so its throughput uses the output token count saved with each assistant message. Timing samples require logged timing evidence.</p></details>
 <details><summary>Coverage</summary><p>Logs in the listed input directories include archived and active sessions. Copies sharing a conversation ID are merged; repeated usage responses, tool calls, and turn completions are counted once. Active logs are read while they may still be growing; the report cutoff limits included activity. Unfinished turns contribute recorded tokens and calls, with completion timings excluded. An older-window label does not imply a complete year of available history. Missing durations are excluded, so conversation duration can be partial.</p></details>
 <details><summary>Cost estimate</summary><p>Current standard API rates are applied to every historical window, with an assumed 50% premium on OpenAI token categories recorded in Fast mode. Normal, including assumed Normal activity, uses base rates. Other explicit tiers also use base rates; their actual premiums are unknown. Codex 5.3 Spark uses GPT-5.4-mini rates and codex-auto-review uses GPT-5.6-luna rates as user-selected proxies, not published prices for those models. These are API-equivalent estimates, not subscription bills. Claude cache writes include separate 5-minute and 1-hour rates when logged; Claude Fast uses its published model-specific premium. Unpublished Fast rates remain unpriced. OpenRouter catalog rates price matched models lacking an embedded rate table. OpenCode input/cache and output/reasoning counters are normalized to avoid overlap. Recorded harness costs and billing units are shown separately. Subscription charges, tool fees, and regional uplifts are excluded. Reasoning is split out of output; cache reads/writes are split out of input. OpenAI long-context rates apply above 272,000 input tokens where published. Older Claude Sonnet rates change above 200,000; Claude 4.6+ uses standard rates throughout its context window. OpenRouter context thresholds come from the catalog. Aggregate counters without per-request sizes assume normal-context rates, including the base OpenRouter rates without context overrides. Recorded speed-mode premiums still apply where known; actual long-context costs may be higher. Blended cost per million tokens divides a category's estimated cost by its priced and unpriced tokens.</p></details>
 </div>

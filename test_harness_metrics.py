@@ -2015,6 +2015,27 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(Decimal(w["cost"]), Decimal(".00267"))
         self.assertEqual(w["recorded_billing"], {"Copilot nano-AIU": "1000000", "Copilot premium requests": "3"})
 
+    def test_copilot_throughput_uses_persisted_message_output_without_usage_events(self):
+        def turn(n, start, seconds, calls):
+            at = START + timedelta(seconds=start)
+            messages = [self.copilot("assistant.message", f"m{n}-{call}-{chunk}",
+                                     {"turnId": "0", "messageId": f"m{n}-{call}-{chunk}", "apiCallId": f"c{n}-{call}",
+                                      "model": "claude-sonnet-4.6", "outputTokens": output, "chunkIndex": chunk}, at)
+                        for call, output in enumerate(calls) for chunk in range(2)]
+            return [self.copilot("assistant.turn_start", f"start{n}", {"turnId": "0", "interactionId": f"i{n}"}, at),
+                    *messages,
+                    self.copilot("assistant.turn_end", f"end{n}", {"turnId": "0"}, at + timedelta(seconds=seconds))]
+        summary = {"modelMetrics": {"claude-sonnet-4.6": {"usage": {"inputTokens": 600, "outputTokens": 400}}}}
+        self.write([self.copilot("session.start", "s", {"sessionId": "same-id"}), *turn(1, 0, 4, [100]),
+                    *turn(2, 10, 6, [100, 200]), self.copilot("session.shutdown", "x", summary, START + timedelta(seconds=20))],
+                   "copilot/events.jsonl")
+        w = self.report({metrics.Harness.COPILOT: [self.root / "copilot"]})["windows"][0]
+        self.assertEqual(w["total_tokens"], 1000)
+        self.assertEqual(w["active_seconds"], 10)
+        self.assertEqual(w["metrics"]["throughput"]["count"], 2)
+        self.assertEqual(w["metrics"]["throughput"]["avg"], 37.5)
+        self.assertNotIn("Missing throughput samples", w["coverage"])
+
     def test_copilot_invalid_models_are_skipped_without_losing_valid_usage(self):
         rows = [self.copilot("session.start", "start", {"sessionId": "same-id"}),
                 self.copilot("session.model_change", "bad-model", {"newModel": 123}),
