@@ -417,6 +417,14 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report["windows"][0]["active_seconds"], 10)
         self.assertEqual(report["windows"][0]["tool_calls"], 1)
 
+    def test_codex_token_count_with_null_info_is_not_malformed(self):
+        self.write(prefix() + [event("token_count", info=None, rate_limits={}), modern(), complete()])
+        with redirect_stderr(io.StringIO()) as stderr:
+            report = self.report()
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn("Malformed records", report["quality"])
+        self.assertEqual(report["windows"][0]["total_tokens"], 1100)
+
     def test_cli_utc_timezone_controls_all_window_boundaries(self):
         self.write(prefix() + [modern(), complete()])
         output = self.root / "report.html"
@@ -1894,6 +1902,16 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse(w["partial_cost"])
         self.assertNotIn("private text", metrics.render_report(r))
         self.assertEqual(r["by_harness"]["claude"]["windows"][0], w)
+
+    def test_claude_turn_without_turn_duration_is_timed_from_prompt(self):
+        user = {"type": "user", "uuid": "u1", "sessionId": "same-id", "timestamp": START.isoformat(),
+                "message": {"role": "user", "content": "hello"}}
+        self.write([user, self.claude(output=100, at=START + timedelta(seconds=4))], "claude/session.jsonl")
+        w = self.report({metrics.Harness.CLAUDE: [self.root / "claude"]})["windows"][0]
+        self.assertEqual(w["active_seconds"], 4)
+        self.assertEqual(w["metrics"]["throughput"]["count"], 1)
+        self.assertEqual(w["metrics"]["throughput"]["avg"], 25)
+        self.assertNotIn("Missing turn duration", w["coverage"])
 
     def test_claude_subagents_with_shared_session_id_are_separate(self):
         self.write([self.claude()], "claude/project/main.jsonl")

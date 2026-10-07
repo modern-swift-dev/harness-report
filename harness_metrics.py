@@ -529,8 +529,9 @@ def read_thread(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
                         "type" in payload and not isinstance(event, str) or
                         any(payload.get(name) is not None and not isinstance(payload[name], str)
                             for name in ("model", "turn_id", "thread_id", "response_id", "call_id")) or
-                        any(name in payload and not isinstance(payload[name], dict)
-                            for name in ("thread_settings", "info")) or
+                        "thread_settings" in payload and not isinstance(payload["thread_settings"], dict) or
+                        # Rate-limit-only token_count events record a null info.
+                        payload.get("info") is not None and not isinstance(payload["info"], dict) or
                         payload.get("internal_chat_message_metadata_passthrough") is not None and
                         not isinstance(payload["internal_chat_message_metadata_passthrough"], dict)):
                     quality.warn("Malformed records", path, index + 1, "invalid record fields; skipped")
@@ -795,6 +796,10 @@ def read_claude(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
                 turn.duration = milliseconds(row.get("durationMs"))
     for turn_id, response in responses.values():
         thread.turns[turn_id].modern.append(response)
+    # Claude Code rarely logs turn_duration; time completed turns from the prompt instead.
+    for turn in thread.turns.values():
+        if turn.duration is None and turn.completed and turn.start and turn.end and turn.end >= turn.start:
+            turn.duration = (turn.end - turn.start).total_seconds()
     return thread
 
 
@@ -1463,7 +1468,7 @@ def session_identity(path: Path, harness: Harness) -> str:
 CHECKPOINT_GROUPS = 250
 
 # Bump when the schema or parser semantics change; cached facts must match the readers.
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 # Children precede parents so older caches can be dropped with foreign keys enabled.
 CACHE_TABLES = ("cache_billing", "cache_calls", "cache_usage", "cache_turns", "cache_threads",
