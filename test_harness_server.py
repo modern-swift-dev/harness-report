@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import io
+import os
 import json
 from pathlib import Path
 import socket
@@ -87,10 +88,10 @@ class ServerTests(unittest.TestCase):
             group = group['by_mode'][scope.mode.value]
         return group
 
-    def assert_trend_parity(self, report, scope, interval, start=None, end=None):
+    def assert_trend_parity(self, report, scope, interval, start=None, end=None, actual=None):
         start = start or self.metadata.first_date
         end = end or self.metadata.cutoff_date
-        actual = self.service.trends(self.metadata.snapshot, start, end, interval, scope)
+        actual = actual or self.service.trends(self.metadata.snapshot, start, end, interval, scope)
         group = self.static_group(report, scope)
         points = group['by_model_trends'][scope.model][interval.value] if scope.model else group['trends'][interval.value]
         first = datetime.combine(start, datetime.min.time(), self.config.report_zone).astimezone(timezone.utc)
@@ -217,6 +218,55 @@ class ServerTests(unittest.TestCase):
                                      metrics.Granularity.DAILY, scopes[-2])
         self.assertEqual(sum(point.ttft.count for point in timing.points if point), 1)
 
+    def test_series_batch_matches_static_trends_in_one_database_pass(self):
+        report = self.static_report()
+        scopes = [server.Scope(), server.Scope(harness=metrics.Harness.CLAUDE),
+                  server.Scope(harness=metrics.Harness.CODEX, tier=metrics.ModelTier.MEDIUM, mode=metrics.SpeedMode.FAST),
+                  server.Scope(model='gpt-6.1-sol-fast-long'), server.Scope(mode=metrics.SpeedMode.FAST)]
+        items = [server.SeriesItem(granularity=interval, scope=scope)
+                 for scope in scopes for interval in metrics.Granularity]
+        # A scope missing from the summaries matches no activity instead of failing the whole batch.
+        missing = server.SeriesItem(scope=server.Scope(harness=metrics.Harness.CLAUDE, mode=metrics.SpeedMode.FAST))
+        self.assertNotIn('fast', report['by_harness']['claude']['by_mode'])
+        with patch.object(metrics.MetricsReader, 'threads', autospec=True,
+                          side_effect=metrics.MetricsReader.threads) as threads:
+            results = self.service.series(self.metadata.snapshot, self.metadata.first_date,
+                                          self.metadata.cutoff_date, items + [missing, items[0]])
+        self.assertEqual(threads.call_count, 1)
+        self.assertEqual(len(results), len(items) + 2)
+        self.assertIs(results[-1], results[0])
+        for item, actual in zip(items, results):
+            with self.subTest(scope=item.scope, interval=item.granularity):
+                self.assert_trend_parity(report, item.scope, item.granularity, actual=actual)
+        self.assertEqual(results[-2].periods, results[1].periods)
+        self.assertTrue(all(point is None for point in results[-2].points))
+        with patch.object(metrics.MetricsReader, 'threads', side_effect=AssertionError('unexpected database scan')):
+            cached = self.service.trends(self.metadata.snapshot, self.metadata.first_date, self.metadata.cutoff_date,
+                                         items[1].granularity, items[1].scope)
+        self.assertIs(cached, results[1])
+
+    def test_report_payload_has_summaries_metadata_and_rates_without_trends(self):
+        snapshot = self.service.current()
+        body = self.service.report()
+        self.assertIs(self.service.report(), body)
+        payload = json.loads(body)
+        self.assertEqual(payload['snapshot'], self.metadata.snapshot)
+        self.assertEqual(payload['first_date'], self.metadata.first_date.isoformat())
+        self.assertEqual(payload['cutoff_date'], self.metadata.cutoff_date.isoformat())
+        self.assertEqual(payload['windows'], snapshot.report['windows'])
+        self.assertEqual(payload['by_harness']['codex']['by_tier']['Medium']['windows'],
+                         snapshot.report['by_harness']['codex']['by_tier']['Medium']['windows'])
+        self.assertEqual(payload['openrouter_rates'], {name: rate.model_dump() for name, rate in snapshot.rates.items()})
+        for key in ('sources', 'quality', 'warnings', 'pricing_date', 'openrouter', 'by_model', 'by_mode'):
+            self.assertIn(key, payload)
+
+        def keys(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    yield key
+                    yield from keys(child)
+        self.assertFalse({'trends', 'by_model_trends', 'trend_periods'} & set(keys(payload)))
+
     def test_mixed_models_modes_and_tiers_keep_complete_turn_attribution(self):
         self.write(self.logs / 'mixed-models.jsonl', prefix(thread='mixed-models') + [modern(),
                    record('turn_context', {'turn_id': 't1', 'model': 'gpt-6-astra'}, START + timedelta(seconds=2)),
@@ -299,6 +349,25 @@ class ServerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'were not cached'):
                 self.service.refresh()
         self.assertEqual(self.service.current().metadata.snapshot, self.metadata.snapshot)
+
+    def test_source_changed_during_import_is_reread_once(self):
+        path = self.logs / 'new.jsonl'
+        self.write(path, prefix(thread='new') + [modern(), complete()])
+        read_thread = metrics.read_thread
+        calls = []
+
+        def write_during_first_read(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                stat = path.stat()
+                os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+            return read_thread(*args)
+
+        with patch('harness_metrics.read_thread', side_effect=write_during_first_read):
+            metadata = self.service.refresh()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(metadata.threads, self.metadata.threads + 1)
+        self.assertEqual(self.service.current().metadata.snapshot, metadata.snapshot)
 
     def test_malformed_records_retain_usage_and_diagnostics(self):
         path = self.logs / 'one.jsonl'
@@ -412,22 +481,46 @@ class ServerTests(unittest.TestCase):
                 time.sleep(.01)
             self.assertTrue(http_server.started)
             url = f'http://127.0.0.1:{port}'
-            def request(path, method='GET'):
+            def request(path, method='GET', payload=None, headers=None):
+                data = json.dumps(payload).encode() if payload is not None else None
+                headers = {**({'Content-Type': 'application/json'} if data else {}), **(headers or {})}
                 try:
-                    with urlopen(Request(url + path, method=method), timeout=10) as response:
+                    with urlopen(Request(url + path, data=data, method=method, headers=headers), timeout=10) as response:
                         return response.status, response.headers, response.read()
                 except HTTPError as error:
                     with error:
                         return error.code, error.headers, error.read()
             status, headers, body = request('/')
             self.assertEqual(status, 200)
-            self.assertLess(len(body), 60000)
+            # The live page shares the static report UI but embeds no metrics.
+            self.assertLess(len(body), 100000)
             self.assertNotIn(b'__REPORT_DATA__', body)
             self.assertNotIn(b'id="report-data"', body)
+            self.assertIn(b'window.reportSource', body)
+            self.assertIn(b'id="mode-pill"', body)
+            self.assertEqual(body.count(b'<script'), 2)
             self.assertEqual(headers['Cache-Control'], 'no-store')
             status, _, body = request('/api/metadata')
             self.assertEqual(status, 200)
             identifier = json.loads(body)['snapshot']
+            status, headers, body = request('/api/report')
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)['snapshot'], identifier)
+            status, headers, _ = request('/api/report', headers={'Accept-Encoding': 'gzip'})
+            self.assertEqual(headers['Content-Encoding'], 'gzip')
+            batch = {'snapshot': identifier, 'start': '2026-09-30', 'end': '2026-09-30',
+                     'items': [{'granularity': 'daily'}, {'granularity': 'hourly', 'scope': {'harness': 'codex'}}]}
+            status, _, body = request('/api/series', 'POST', batch)
+            self.assertEqual(status, 200)
+            results = json.loads(body)['results']
+            self.assertEqual([len(result['points']) for result in results][0], 1)
+            self.assertEqual((results[1]['granularity'], results[1]['scope']['harness']), ('hourly', 'codex'))
+            for invalid in ({**batch, 'items': []}, {**batch, 'start': '2026-10-01'},
+                            {**batch, 'items': [{'scope': {'harness': 'invalid'}}]}):
+                status, _, _ = request('/api/series', 'POST', invalid)
+                self.assertEqual(status, 422)
+            status, _, _ = request('/api/series', 'POST', {**batch, 'snapshot': 'obsolete'})
+            self.assertEqual(status, 409)
             status, _, _ = request('/api/dashboard?' + urlencode({'snapshot': identifier, 'harness': 'invalid'}))
             self.assertEqual(status, 422)
             status, _, _ = request('/api/dashboard?' + urlencode({'snapshot': identifier, 'window': 'invalid'}))

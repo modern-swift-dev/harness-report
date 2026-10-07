@@ -22,8 +22,7 @@ Keep one fix or feature per branch. For larger changes, describe the proposed be
 | --- | --- |
 | `harness_metrics.py` | CLI, storage readers, typed domain models, pricing, aggregation, and rendering. |
 | `test_harness_metrics.py` | Synthetic JSONL and SQLite fixtures, unit tests, and CLI integration tests. |
-| `harness_server.py` | FastAPI server, refresh snapshots, typed responses, and lazy chart queries. |
-| `harness_dashboard.html` | Lean dashboard with local styles and JavaScript that requests the REST API. |
+| `harness_server.py` | FastAPI server, refresh snapshots, typed responses, lazy chart queries, and the live data source injected into the shared report UI. |
 | `test_harness_server.py` | Optional API, cache consistency, and static-calculation parity tests. |
 | `README.md` | Installation, usage, report interpretation, and troubleshooting. |
 | `AGENTS.md` | Repository coding and workflow guidelines. |

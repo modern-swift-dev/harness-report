@@ -23,8 +23,9 @@ from uuid import uuid4
 try:
     from fastapi import FastAPI, HTTPException, Query, Request
     from fastapi.concurrency import run_in_threadpool
-    from fastapi.responses import FileResponse, Response
-    from pydantic import BaseModel
+    from fastapi.middleware.gzip import GZipMiddleware
+    from fastapi.responses import HTMLResponse, Response
+    from pydantic import BaseModel, Field
     import uvicorn
 except ImportError as error:
     raise ImportError("Install server dependencies: python3 -m pip install -r requirements-server.txt") from error
@@ -166,6 +167,23 @@ class TrendResponse(BaseModel):
     range_end: str
 
 
+class SeriesItem(BaseModel):
+    granularity: metrics.Granularity = metrics.Granularity.DAILY
+    scope: Scope = Scope()
+
+
+class SeriesRequest(BaseModel):
+    snapshot: str
+    start: date
+    end: date
+    items: list[SeriesItem] = Field(min_length=1, max_length=64)
+
+
+class SeriesResponse(BaseModel):
+    snapshot: str
+    results: list[TrendResponse]
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     sources: dict[metrics.Harness, list[Path]]
@@ -182,6 +200,23 @@ class Snapshot:
     rates: dict[str, RouterRate]
     database_version: int = 0
     file_identity: tuple[int, int] = (0, 0)
+    payload: bytes | None = None
+
+
+class UnstableSourcesError(ValueError):
+    """Sources changed or were unreadable during import, so nothing was cached."""
+
+
+def without_trends(group: dict[str, Any]) -> dict[str, Any]:
+    """Drop trend arrays; the dashboard requests series for its chosen dates instead."""
+    result = {}
+    for key, value in group.items():
+        if key in ('trends', 'by_model_trends', 'trend_periods'):
+            continue
+        if key in ('by_harness', 'by_tier', 'by_mode'):
+            value = {name: without_trends(child) for name, child in value.items()}
+        result[key] = value
+    return result
 
 
 class DashboardService:
@@ -224,6 +259,14 @@ class DashboardService:
 
     def refresh(self) -> Metadata:
         with self.lock:
+            try:
+                return self.import_sources()
+            except UnstableSourcesError:
+                # Live harness databases may be written mid-read; a second read usually sees a quiet moment.
+                return self.import_sources()
+
+    def import_sources(self) -> Metadata:
+        with self.lock:
             now = datetime.now(timezone.utc)
             pinned: list[tuple[int, tuple[int, int]]] = []
 
@@ -246,9 +289,9 @@ class DashboardService:
                 if prepared.uncached_sources:
                     shown = ", ".join(prepared.uncached_sources[:3])
                     more = len(prepared.uncached_sources) - 3
-                    raise ValueError("Some sources changed or could not be read and were not cached: "
-                                     f"{shown}{f' and {more:,} more' if more > 0 else ''}. "
-                                     "Check source access and retry Refresh; the previous snapshot is retained.")
+                    raise UnstableSourcesError("Some sources changed or could not be read and were not cached: "
+                                               f"{shown}{f' and {more:,} more' if more > 0 else ''}. "
+                                               "Check source access and retry Refresh; the previous snapshot is retained.")
                 print("Calculating summaries for all cached conversations…", file=sys.stderr)
                 candidate = self.calculate_snapshot(prepared.cache, now)
             candidate.database_version, candidate.file_identity = pinned[0]
@@ -365,67 +408,171 @@ class DashboardService:
                 recorded_billing=harness['windows'][index]['recorded_billing'],
                 openrouter_rates={name: rate for name, rate in snapshot.rates.items() if name in models})
 
+    def report(self) -> bytes:
+        """Serialized summaries and metadata for the dashboard, built once per snapshot."""
+        with self.lock:
+            snapshot = self.current()
+            if snapshot.payload is None:
+                payload = {**snapshot.metadata.model_dump(mode='json'), **without_trends(snapshot.report),
+                           'openrouter_rates': {name: rate.model_dump() for name, rate in snapshot.rates.items()}}
+                snapshot.payload = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+            return snapshot.payload
+
     def trends(self, identifier: str, start: date, end: date, granularity: metrics.Granularity,
                scope: Scope) -> TrendResponse:
         with self.lock:
             snapshot = self.current(identifier)
-            metadata = snapshot.metadata
             self.selected_group(snapshot, scope)
             if scope.model is not None and scope.model not in snapshot.report['by_model']:
                 raise HTTPException(422, "Unknown model.")
+            return self.series(identifier, start, end, [SeriesItem(granularity=granularity, scope=scope)])[0]
+
+    def trend_windows(self, metadata: Metadata, start: date, end: date,
+                      granularity: metrics.Granularity) -> tuple[list[metrics.Window], datetime, datetime]:
+        now = datetime.fromisoformat(metadata.generated).astimezone(timezone.utc)
+        zone = self.config.report_zone
+        start_local = datetime.combine(start, datetime.min.time(), zone)
+        end_local = datetime.combine(end + timedelta(days=1), datetime.min.time(), zone)
+        first_local = datetime.combine(metadata.first_date, datetime.min.time(), zone)
+        period_start, period_end = start_local, end_local
+        if granularity == metrics.Granularity.WEEKLY:
+            period_start -= timedelta(days=period_start.weekday())
+            period_end += timedelta(days=(-period_end.weekday()) % 7)
+        elif granularity == metrics.Granularity.MONTHLY:
+            period_start = period_start.replace(day=1)
+            if period_end.day != 1:
+                period_end = (period_end.replace(year=period_end.year + 1, month=1, day=1)
+                              if period_end.month == 12 else period_end.replace(month=period_end.month + 1, day=1))
+        windows = metrics.make_trend_windows(min(period_end.astimezone(timezone.utc), now), zone,
+                                            max(period_start, first_local), (granularity,))
+        range_start = start_local.astimezone(timezone.utc)
+        windows = [window for window in windows
+                   if window.start.astimezone(zone).date() <= end
+                   and (window.end > range_start or window.end == range_start and not window.end_exclusive)]
+        return windows, range_start, min(end_local.astimezone(timezone.utc), now)
+
+    def series(self, identifier: str, start: date, end: date, items: list[SeriesItem]) -> list[TrendResponse]:
+        """Calculate several filtered series for one date range in a single pass over the cache."""
+        with self.lock:
+            metadata = self.current(identifier).metadata
             if not metadata.first_date <= start <= end <= metadata.cutoff_date:
                 raise HTTPException(422, "Choose dates within available history, with Start on or before End.")
-            key = start, end, granularity, scope.model_dump_json()
-            if key in self.trend_cache:
-                self.trend_cache.move_to_end(key)
-                return self.trend_cache[key]
-            now = datetime.fromisoformat(metadata.generated).astimezone(timezone.utc)
-            zone = self.config.report_zone
-            start_local = datetime.combine(start, datetime.min.time(), zone)
-            end_local = datetime.combine(end + timedelta(days=1), datetime.min.time(), zone)
-            first_local = datetime.combine(metadata.first_date, datetime.min.time(), zone)
-            period_start, period_end = start_local, end_local
-            if granularity == metrics.Granularity.WEEKLY:
-                period_start -= timedelta(days=period_start.weekday())
-                period_end += timedelta(days=(-period_end.weekday()) % 7)
-            elif granularity == metrics.Granularity.MONTHLY:
-                period_start = period_start.replace(day=1)
-                if period_end.day != 1:
-                    period_end = (period_end.replace(year=period_end.year + 1, month=1, day=1)
-                                  if period_end.month == 12 else period_end.replace(month=period_end.month + 1, day=1))
-            windows = metrics.make_trend_windows(min(period_end.astimezone(timezone.utc), now), zone,
-                                                max(period_start, first_local), (granularity,))
-            range_start = start_local.astimezone(timezone.utc)
-            windows = [window for window in windows
-                       if window.start.astimezone(zone).date() <= end
-                       and (window.end > range_start or window.end == range_start and not window.end_exclusive)]
-            lookup = metrics.WindowLookup(windows)
-            span = (windows[0].start, windows[-1].end) if windows else (range_start, range_start)
-            metric_scope = metrics.MetricScope(scope.model, scope.mode, scope.tier)
+            keys = [(start, end, item.granularity, item.scope.model_dump_json()) for item in items]
+            results: dict[tuple[date, date, metrics.Granularity, str], TrendResponse] = {}
+            missing: dict[tuple[date, date, metrics.Granularity, str], SeriesItem] = {}
+            for key, item in zip(keys, items):
+                if key in self.trend_cache:
+                    self.trend_cache.move_to_end(key)
+                    results[key] = self.trend_cache[key]
+                else:
+                    missing[key] = item
+            if not missing:
+                return [results[key] for key in keys]
+            # Unavailable scopes need no validation here: they match no activity and return empty points.
+            plans = {key: (*self.trend_windows(metadata, start, end, item.granularity), item)
+                     for key, item in missing.items()}
+            lookups = {key: metrics.WindowLookup(windows) for key, (windows, *_) in plans.items()}
+            starts = [windows[0].start for windows, *_ in plans.values() if windows]
+            ends = [windows[-1].end for windows, *_ in plans.values() if windows]
+            range_start = next(iter(plans.values()))[1]
+            span = (min(starts), max(ends)) if starts else (range_start, range_start)
+            harnesses = {item.scope.harness for item in missing.values()}
+            shared = next(iter(harnesses)) if len(harnesses) == 1 else None
             with closing(self.read_connection()) as connection:
                 connection.execute('BEGIN')
                 reader = metrics.MetricsReader(connection)
-                for thread in reader.threads(metrics.Quality(), scope.harness, span):
+                for thread in reader.threads(metrics.Quality(), shared, span):
                     thread.id = f"{thread.harness.value}:{thread.id}"
-                    metrics.add_thread(windows, thread, catalog=self.config.catalog, lookup=lookup, scope=metric_scope)
+                    for key, (windows, _, _, item) in plans.items():
+                        scope = item.scope
+                        if windows and (scope.harness is None or scope.harness == thread.harness):
+                            metrics.add_thread(windows, thread, catalog=self.config.catalog, lookup=lookups[key],
+                                               scope=metrics.MetricScope(scope.model, scope.mode, scope.tier))
             self.current(identifier)
-            response = TrendResponse(
-                snapshot=identifier, scope=scope, granularity=granularity,
-                periods=[Period(label=window.label, start=window.start.astimezone(zone).isoformat(),
-                                end=window.end.astimezone(zone).isoformat(), end_exclusive=window.end_exclusive)
-                         for window in windows],
-                points=[TrendPoint(**point) if (point := metrics.trend_summary(window)) is not None else None
-                        for window in windows], range_start=range_start.isoformat(),
-                range_end=min(end_local.astimezone(timezone.utc), now).isoformat())
-            size = len(response.model_dump_json().encode('utf-8'))
-            # Bound both entry count and serialized size; a large series can be returned uncached.
-            if size <= 8 * 1024 * 1024:
-                self.trend_cache[key] = response
-                self.trend_cache_bytes += size
-                while len(self.trend_cache) > 32 or self.trend_cache_bytes > 8 * 1024 * 1024:
-                    _, discarded = self.trend_cache.popitem(last=False)
-                    self.trend_cache_bytes -= len(discarded.model_dump_json().encode('utf-8'))
-            return response
+            zone = self.config.report_zone
+            for key, (windows, window_start, window_end, item) in plans.items():
+                response = TrendResponse(
+                    snapshot=identifier, scope=item.scope, granularity=item.granularity,
+                    periods=[Period(label=window.label, start=window.start.astimezone(zone).isoformat(),
+                                    end=window.end.astimezone(zone).isoformat(), end_exclusive=window.end_exclusive)
+                             for window in windows],
+                    points=[TrendPoint(**point) if (point := metrics.trend_summary(window)) is not None else None
+                            for window in windows], range_start=window_start.isoformat(),
+                    range_end=window_end.isoformat())
+                results[key] = response
+                size = len(response.model_dump_json().encode('utf-8'))
+                # Bound both entry count and serialized size; a large series can be returned uncached.
+                if size <= 8 * 1024 * 1024:
+                    self.trend_cache[key] = response
+                    self.trend_cache_bytes += size
+                    while len(self.trend_cache) > 32 or self.trend_cache_bytes > 8 * 1024 * 1024:
+                        _, discarded = self.trend_cache.popitem(last=False)
+                        self.trend_cache_bytes -= len(discarded.model_dump_json().encode('utf-8'))
+            return [results[key] for key in keys]
+
+
+# Loaded before the shared report script: supplies its data on demand and adds live controls.
+LIVE_SCRIPT = r"""
+'use strict';
+window.reportSource=(()=>{
+    const $=id=>document.getElementById(id),memo=new Map();let snapshot=null,queue=null;
+    const pill=$('mode-pill');pill.lastChild.textContent='Live';pill.title='Served by the local dashboard server';
+    const coverage=$('coverage-def');coverage.textContent=coverage.textContent.replace('Logs in the listed input directories include archived and active sessions.','The dashboard includes every conversation retained in the metrics database, including cached sources that no longer exist; Refresh imports only configured sources.');
+    const alert=document.createElement('div');alert.className='notice';alert.setAttribute('role','alert');alert.hidden=true;$('notice').before(alert);
+    const showError=error=>{alert.hidden=false;alert.replaceChildren(document.createElement('span'),document.createElement('span'));alert.firstChild.textContent='⚠';alert.lastChild.textContent=error.message};
+    const button=document.createElement('button');button.type='button';button.className='ghost';button.textContent='Refresh sources';button.title='Import changed logs and recalculate every metric';pill.after(button);
+    button.addEventListener('click',async()=>{
+        button.disabled=true;button.textContent='Refreshing…';document.body.setAttribute('aria-busy','true');alert.hidden=true;
+        try{await api('/api/refresh',{method:'POST'});location.reload()}
+        catch(error){showError(error);button.disabled=false;button.textContent='Refresh sources';document.body.removeAttribute('aria-busy')}
+    });
+    async function api(path,options={}){
+        let response;
+        try{response=await fetch(path,options)}catch(error){throw new Error('Unable to reach the local server. Check that it is running, then reload.')}
+        const body=await response.json().catch(()=>null);
+        if(!response.ok){
+            const detail=Array.isArray(body?.detail)?body.detail.map(issue=>issue.msg).join('; '):body?.detail;
+            const error=new Error(detail||`Request failed (${response.status}).`);error.status=response.status;throw error;
+        }
+        if(body===null)throw new Error('The server returned an unreadable response.');
+        return body;
+    }
+    // Requests made while one view renders are sent together, one batch per date range.
+    function flush(){
+        const groups=new Map();
+        for(const entry of queue){const key=`${entry.start}|${entry.end}`;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(entry)}
+        queue=null;
+        for(const entries of groups.values())for(let i=0;i<entries.length;i+=32){
+            const chunk=entries.slice(i,i+32);
+            api('/api/series',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({snapshot,start:chunk[0].start,end:chunk[0].end,items:chunk.map(e=>e.item)})})
+                .then(body=>chunk.forEach((e,k)=>e.resolve({periods:body.results[k].periods,points:body.results[k].points})),
+                      error=>{if(error.status===409)showError(error);chunk.forEach(e=>e.reject(error))});
+        }
+    }
+    return {
+        live:true,
+        async load(){
+            try{const data=await api('/api/report');snapshot=data.snapshot;return data}
+            catch(error){showError(error);throw error}
+        },
+        series(scope,granularity,start,end){
+            const item={granularity,scope:{harness:scope.harness||null,tier:scope.tier||null,model:scope.model||null,mode:scope.mode||null}},key=JSON.stringify([start,end,item]);
+            if(memo.has(key)){const cached=memo.get(key);memo.delete(key);memo.set(key,cached);return cached}
+            const promise=new Promise((resolve,reject)=>{if(!queue){queue=[];queueMicrotask(flush)}queue.push({start,end,item,resolve,reject})});
+            memo.set(key,promise);if(memo.size>96)memo.delete(memo.keys().next().value);
+            promise.catch(()=>{if(memo.get(key)===promise)memo.delete(key)});
+            return promise;
+        }};
+})();
+"""
+
+
+def dashboard_page_html() -> str:
+    """The static report template, with embedded data replaced by the live data source."""
+    embedded = '<script type="application/json" id="report-data">__REPORT_DATA__</script>'
+    if metrics.HTML.count(embedded) != 1:
+        raise RuntimeError("The report template has no single embedded data block.")
+    return metrics.HTML.replace(embedded, '<script>' + LIVE_SCRIPT + '</script>')
 
 
 def create_app(config: ServerConfig) -> FastAPI:
@@ -447,6 +594,9 @@ def create_app(config: ServerConfig) -> FastAPI:
     # No CDN-backed documentation pages are needed for the offline dashboard.
     app = FastAPI(title='Harness dashboard', lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.service = service
+    # Hourly series and full summaries are repetitive JSON that compresses well.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    page = dashboard_page_html()
 
     @app.middleware('http')
     async def no_browser_cache(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
@@ -454,14 +604,18 @@ def create_app(config: ServerConfig) -> FastAPI:
         response.headers['Cache-Control'] = 'no-store'
         return response
 
-    @app.get('/', response_class=FileResponse)
-    def dashboard_page() -> FileResponse:
-        return FileResponse(Path(__file__).resolve().with_name('harness_dashboard.html'))
+    @app.get('/', response_class=HTMLResponse)
+    def dashboard_page() -> HTMLResponse:
+        return HTMLResponse(page)
 
     @app.get('/api/metadata', response_model=Metadata)
     def metadata() -> Metadata:
         with service.lock:
             return service.current().metadata
+
+    @app.get('/api/report')
+    def report() -> Response:
+        return Response(service.report(), media_type='application/json')
 
     @app.get('/api/dashboard', response_model=DashboardResponse)
     def dashboard(snapshot: str = Query(...), window: ReportWindow = ReportWindow.TODAY,
@@ -475,6 +629,11 @@ def create_app(config: ServerConfig) -> FastAPI:
                harness: metrics.Harness | None = None, tier: metrics.ModelTier | None = None,
                model: str | None = None, mode: metrics.SpeedMode | None = None) -> TrendResponse:
         return service.trends(snapshot, start, end, granularity, Scope(harness=harness, tier=tier, model=model, mode=mode))
+
+    @app.post('/api/series', response_model=SeriesResponse)
+    def series(request: SeriesRequest) -> SeriesResponse:
+        return SeriesResponse(snapshot=request.snapshot,
+                              results=service.series(request.snapshot, request.start, request.end, request.items))
 
     @app.post('/api/refresh', response_model=Metadata)
     def refresh() -> Metadata:

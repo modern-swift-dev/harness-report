@@ -1,5 +1,8 @@
 .PHONY: serve setup
 
+generate:
+	python3 harness_metrics.py
+
 serve:
 	.venv/bin/python harness_server.py
 

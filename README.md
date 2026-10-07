@@ -64,9 +64,9 @@ make serve
 
 Open [http://localhost:3050](http://localhost:3050). The server binds to `127.0.0.1:3050` and needs no internet connection with the default pricing. Press Ctrl+C to stop it. An occupied port stops startup before any source import.
 
-The dashboard HTML is approximately 50 KB, with no embedded metrics. It preserves the static report's controls, charts, comparisons, and data-quality sections. The browser requests summaries for the current filters and one chart series for the chosen dates and interval. The server calculates reporting summaries once per refresh and keeps a bounded cache of requested chart series. Startup and refresh can take tens of seconds for large databases; later view requests reuse those summaries.
+The dashboard uses the same interface as the static report, served without embedded metrics (approximately 90 KB, 27 KB compressed). The browser loads all reporting summaries once per refresh, then requests chart series for the chosen dates, interval, and filters; series needed by one view are sent together and calculated in a single pass over the cache. The server calculates reporting summaries once per refresh and keeps a bounded cache of requested chart series. Startup and refresh can take tens of seconds for large databases; later view requests reuse those summaries.
 
-Startup imports configured sources into the persistent cache without generating a static report. **Refresh sources** repeats the import and recalculates summaries; controls pause until it finishes. There is no automatic polling. Failed refreshes retain the previous snapshot. Sources that change while being read or cannot be imported cause a refresh error that names the affected files; check access and retry. If the startup import fails, the server still starts and the dashboard shows the error until a refresh succeeds. Malformed individual records are skipped with diagnostics while valid usage is retained.
+Startup imports configured sources into the persistent cache without generating a static report. **Refresh sources** repeats the import and recalculates summaries; controls pause until it finishes, then the page reloads with the same window, filters, and dates. Dates left at the first or latest day follow new history. There is no automatic polling. Failed refreshes retain the previous snapshot. Sources that change while being read or cannot be imported cause a refresh error that names the affected files; check access and retry. If the startup import fails, the server still starts and the dashboard shows the error until a refresh succeeds. Malformed individual records are skipped with diagnostics while valid usage is retained.
 
 The dashboard includes **every conversation retained in the chosen metrics database**, including cached sources that no longer exist. Source arguments and `--harness` select what to import during refresh; use the dashboard filters to control what is displayed. Changing source options does not remove older cached conversations. Choose a separate `--cache` path to isolate an archive.
 
@@ -85,11 +85,13 @@ The local REST API provides:
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/metadata` | Current snapshot ID, cutoff, history, choices, pricing, and diagnostics. |
+| `GET /api/report` | Metadata plus every reporting summary and catalog rate, as used by the dashboard. Trend series are omitted. |
 | `GET /api/dashboard` | Reporting summaries, model/tier comparisons, billing, and catalog rates for selected filters. |
 | `GET /api/trends` | One filtered series for the requested dates and interval, retaining gaps. |
+| `POST /api/series` | Up to 64 filtered series for one date range, calculated together. |
 | `POST /api/refresh` | Import configured sources and publish a new snapshot. |
 
-Dashboard queries require `snapshot` and accept `window` (`today`, `yesterday`, or `last_N_days` for the supported windows), `harness`, `tier`, `model`, and `mode`. Trend queries require `snapshot`, `start`, and `end` (ISO dates), and also accept the scope filters and `granularity` (`hourly`, `daily`, `weekly`, or `monthly`). Enum values for tier and mode match their dashboard labels. `/openapi.json` documents the typed request and response schemas. Invalid queries return 422; stale snapshots return 409. Both HTML and API responses disable browser caching.
+Dashboard queries require `snapshot` and accept `window` (`today`, `yesterday`, or `last_N_days` for the supported windows), `harness`, `tier`, `model`, and `mode`. Trend queries require `snapshot`, `start`, and `end` (ISO dates), and also accept the scope filters and `granularity` (`hourly`, `daily`, `weekly`, or `monthly`). Series requests take a JSON body with `snapshot`, `start`, `end`, and `items`, each with a `granularity` and a `scope` object of the same filters; a filter combination with no summaries returns empty points rather than 422. Enum values for tier and mode match their dashboard labels. `/openapi.json` documents the typed request and response schemas. Invalid queries return 422; stale snapshots return 409. Both HTML and API responses disable browser caching.
 
 Static HTML generation is unchanged and does not require these dependencies.
 

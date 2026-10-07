@@ -1880,6 +1880,27 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(updated["windows"][0]["total_tokens"], report["windows"][0]["total_tokens"] + 200)
             self.assertEqual(updated, metrics.collect_report(self.root, NOW, harness_roots=sources, include_codex=False))
 
+    def test_sqlite_cache_ignores_wal_metadata_only_changes(self):
+        path = self.opencode_db()
+        cache = self.root / "metrics.sqlite3"
+        sources = {metrics.Harness.OPENCODE: [path]}
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute("UPDATE message SET session_id=session_id")
+            connection.commit()
+            wal = Path(str(path) + "-wal")
+            report = metrics.collect_report(self.root, NOW, harness_roots=sources, include_codex=False, cache_path=cache)
+            # macOS retags a WAL's provenance xattr when SQLite opens it, changing only ctime.
+            ctime = wal.stat().st_ctime_ns
+            os.chmod(wal, wal.stat().st_mode)
+            while wal.stat().st_ctime_ns == ctime:
+                os.chmod(wal, wal.stat().st_mode)
+            with patch("harness_metrics.read_opencode", wraps=metrics.read_opencode) as read:
+                self.assertEqual(metrics.collect_report(self.root, NOW, harness_roots=sources, include_codex=False,
+                                                        cache_path=cache), report)
+                self.assertEqual(read.call_count, 0)
+
     def test_sqlite_cache_cannot_write_to_harness_database(self):
         path = self.opencode_db()
         original = path.read_bytes()

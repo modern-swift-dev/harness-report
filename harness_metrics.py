@@ -1496,9 +1496,10 @@ CACHE_TABLES = ("cache_billing", "cache_calls", "cache_usage", "cache_turns", "c
                 "cache_groups", "cache_files")
 
 
-def file_stamp(path: Path) -> str:
+def file_stamp(path: Path, ctime: bool = True) -> str:
     stat = path.stat()
-    return json.dumps([stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns])
+    fields = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
+    return json.dumps(fields + [stat.st_ctime_ns] if ctime else fields)
 
 
 def cache_tables(connection: sqlite3.Connection) -> set[str]:
@@ -1778,9 +1779,11 @@ def source_manifest(paths: list[Path], harness: Harness, attribution: str = "") 
     for path in paths:
         stamps.append((str(path), file_stamp(path) + attribution))
         if harness in (Harness.OPENCODE, Harness.T3):
-            # Uncheckpointed SQLite writes live in the WAL, not the main database.
+            # Uncheckpointed SQLite writes live in the WAL, not the main database. SQLite opens the WAL
+            # read-write even for read-only connections, and macOS then retags its provenance xattr,
+            # changing ctime without a write; WAL writes always change mtime or size.
             wal = Path(str(path) + "-wal")
-            stamps.append((str(wal), file_stamp(wal) if wal.exists() else "missing"))
+            stamps.append((str(wal), file_stamp(wal, ctime=False) if wal.exists() else "missing"))
     return json.dumps(stamps)
 
 
@@ -2189,12 +2192,12 @@ main{max-width:1320px;margin:auto;padding:0 28px 48px}
 .scope-line{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--muted)}.chip{display:inline-flex;align-items:center;gap:4px;border-radius:999px;background:var(--accent-wash);color:var(--ink);padding:2px 4px 2px 10px;font-size:12px}.chip button{border:0;background:none;color:var(--ink-2);border-radius:50%;width:20px;height:20px;line-height:1;padding:0}.chip button:hover{background:var(--surface-3)}.link-btn{border:0;background:none;color:var(--accent);padding:0;font-size:12px}
 .section{margin-top:36px}.section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px 20px;margin-bottom:14px;flex-wrap:wrap}.section-head p{color:var(--muted);font-size:12.5px;margin-top:3px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);padding:20px;min-width:0}.card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}.card-head p{color:var(--muted);font-size:12.5px;margin-top:2px}
-.notice{display:flex;gap:10px;align-items:flex-start;padding:10px 14px;background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:10px;color:var(--warn-ink);font-size:13px;margin-top:16px}.notice b{font-weight:650}
+.notice{display:flex;gap:10px;align-items:flex-start;padding:10px 14px;background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:10px;color:var(--warn-ink);font-size:13px;margin-top:16px}.notice b{font-weight:650}.notice[hidden]{display:none}
 .kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:20px}.kpi{padding:16px 16px 10px;display:flex;flex-direction:column}.kpi-label{font-size:12.5px;color:var(--ink-2);font-weight:550}.kpi-value{font-size:28px;font-weight:650;letter-spacing:-.6px;line-height:1.15;margin-top:6px}.kpi-note{font-size:12px;color:var(--muted);margin-top:2px;min-height:18px}.kpi .spark{margin-top:auto;padding-top:10px}.kpi-split{margin:10px 0 0;font-size:12px;display:grid;gap:3px}.kpi-split div{display:flex;justify-content:space-between;gap:8px}.kpi-split dt{color:var(--muted)}.kpi-split dd{margin:0;font-variant-numeric:tabular-nums;font-weight:550}
 .grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.stack{display:grid;gap:16px}
 .legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--ink-2);margin-top:12px}.legend span{display:inline-flex;align-items:center;gap:6px}.key{width:10px;height:10px;border-radius:3px;display:inline-block;flex:none}.key.line{height:2px;width:14px;border-radius:2px}
 .chart{margin-top:10px;position:relative;min-height:40px}.chart svg{display:block;overflow:visible}.chart svg text{font-size:11px;fill:var(--muted);font-variant-numeric:tabular-nums}.chart svg:focus-visible{outline:2px solid var(--focus);outline-offset:4px;border-radius:4px}
-.empty{padding:36px 16px;text-align:center;color:var(--muted);background:var(--surface-2);border-radius:10px;font-size:13px}
+.chart[aria-busy=true]>*{opacity:.5;transition:opacity .2s}body[aria-busy=true] main>:not(.masthead){opacity:.6;pointer-events:none;transition:opacity .2s}.empty{padding:36px 16px;text-align:center;color:var(--muted);background:var(--surface-2);border-radius:10px;font-size:13px}
 .view-toggle{font-size:12px}.data-table{margin-top:12px;max-height:340px;overflow:auto;border:1px solid var(--border);border-radius:10px}
 .headline{display:flex;align-items:baseline;gap:14px;margin-top:10px;flex-wrap:wrap}.headline strong{font-size:24px;font-weight:650;letter-spacing:-.4px}.headline span{font-size:12.5px;color:var(--muted)}
 .dist{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px;margin-top:14px;padding-top:12px;border-top:1px solid var(--grid)}.dist div{min-width:0}.dist dt{font-size:11px;color:var(--muted)}.dist dd{margin:1px 0 0;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.samples{font-size:12px;color:var(--muted);margin-top:8px}
@@ -2222,7 +2225,7 @@ noscript{display:block;padding:20px;background:var(--warn-bg)}
 </style>
 </head>
 <body><main>
-<header class="masthead"><div><div class="eyebrow">Coding agents · Usage report</div><h1>Conversation metrics</h1><p class="subtitle" id="subtitle"></p></div><div class="head-actions"><span class="pill"><i></i>Offline report</span><button type="button" class="ghost" id="theme-toggle" aria-label="Color theme">Theme: System</button></div></header>
+<header class="masthead"><div><div class="eyebrow">Coding agents · Usage report</div><h1>Conversation metrics</h1><p class="subtitle" id="subtitle"></p></div><div class="head-actions"><span class="pill" id="mode-pill"><i></i>Offline report</span><button type="button" class="ghost" id="theme-toggle" aria-label="Color theme">Theme: System</button></div></header>
 <noscript>This report requires JavaScript to display its embedded data and charts. No internet connection is needed.</noscript>
 <div class="toolbar" role="region" aria-label="Report filters">
 <div class="toolbar-row"><nav class="segmented" aria-label="Reporting window" id="tabs"></nav>
@@ -2275,7 +2278,7 @@ noscript{display:block;padding:20px;background:var(--warn-bg)}
 <details><summary>Model tiers</summary><p>Budget: Luna, Terra, GPT mini and nano models, Spark, codex-auto-review, and Claude Haiku. Medium: Sol, GPT-5.4, GPT-5.5, and Claude Sonnet. High: Astra, Claude Opus, Fable, and Mythos. Models outside these groups are Unclassified. Tier metrics are calculated from underlying activity, with each conversation counted once per tier. Turns using several models in the same tier retain their timing in that tier; turns spanning tiers have timing under “Mixed tiers (timing)”. Per-model pricing and the Fast premium still apply. The model selector and comparison table show entries with recorded tokens in the selected window, harness, tier, and mode. Zero-token entries, including shared timing and tool-call buckets, remain included in aggregate totals and coverage.</p></details>
 <details><summary>Mode attribution</summary><p>Logged service tier “default” is Normal; “priority” or “fast” is Fast. Settings persist until changed. Per the selected assumption, unknown mode—including missing evidence, explicit null, and “auto”—is counted as Normal in all metrics and costs. Other explicit tiers have their own bucket. Tokens and calls follow their recorded tier or the latest logged settings. This combines logged mode with the Normal assumption; a backend fallback cannot be detected without a response tier. A turn with usage in several modes has its timing under “Mixed modes (timing)” because separate durations are unavailable. Conversation durations and calls include only activity attributed to the selected mode.</p></details>
 <details><summary>Harness coverage</summary><p>Claude Code reads project JSONL files, Copilot reads CLI session events, and OpenCode reads its message and tool tables. T3 Code links saved native sessions to the Codex, Claude Code, and OpenCode readers; linked sessions count once under T3 when selected. Missing native logs and other T3 providers are outside coverage. Copilot shutdown-only totals are assigned to shutdown, which does not establish when individual requests occurred. Copilot does not persist per-request usage, so its throughput uses the output token count saved with each assistant message. Timing samples require logged timing evidence.</p></details>
-<details><summary>Coverage</summary><p>Logs in the listed input directories include archived and active sessions. Copies sharing a conversation ID are merged; repeated usage responses, tool calls, and turn completions are counted once. Active logs are read while they may still be growing; the report cutoff limits included activity. Unfinished turns contribute recorded tokens and calls, with completion timings excluded. An older-window label does not imply a complete year of available history. Missing durations are excluded, so conversation duration can be partial.</p></details>
+<details><summary>Coverage</summary><p id="coverage-def">Logs in the listed input directories include archived and active sessions. Copies sharing a conversation ID are merged; repeated usage responses, tool calls, and turn completions are counted once. Active logs are read while they may still be growing; the report cutoff limits included activity. Unfinished turns contribute recorded tokens and calls, with completion timings excluded. An older-window label does not imply a complete year of available history. Missing durations are excluded, so conversation duration can be partial.</p></details>
 <details><summary>Cost estimate</summary><p>Current standard API rates are applied to every historical window, with an assumed 50% premium on OpenAI token categories recorded in Fast mode. Normal, including assumed Normal activity, uses base rates. Other explicit tiers also use base rates; their actual premiums are unknown. Codex 5.3 Spark uses GPT-5.4-mini rates and codex-auto-review uses GPT-5.6-luna rates as user-selected proxies, not published prices for those models. These are API-equivalent estimates, not subscription bills. Claude cache writes include separate 5-minute and 1-hour rates when logged; Claude Fast uses its published model-specific premium. Unpublished Fast rates remain unpriced. OpenRouter catalog rates price matched models lacking an embedded rate table. OpenCode input/cache and output/reasoning counters are normalized to avoid overlap. Recorded harness costs and billing units are shown separately. Subscription charges, tool fees, and regional uplifts are excluded. Reasoning is split out of output; cache reads/writes are split out of input. OpenAI long-context rates apply above 272,000 input tokens where published. Older Claude Sonnet rates change above 200,000; Claude 4.6+ uses standard rates throughout its context window. OpenRouter context thresholds come from the catalog. Aggregate counters without per-request sizes assume normal-context rates, including the base OpenRouter rates without context overrides. Recorded speed-mode premiums still apply where known; actual long-context costs may be higher. Blended cost per million tokens divides a category's estimated cost by its priced and unpriced tokens.</p></details>
 </div>
 <details class="more"><summary>Exact metrics for every window</summary><div class="table-wrap"><table id="all-metrics"></table></div></details>
@@ -2286,8 +2289,10 @@ noscript{display:block;padding:20px;background:var(--warn-bg)}
 <script type="application/json" id="report-data">__REPORT_DATA__</script>
 <script>
 'use strict';
-const data=JSON.parse(document.getElementById('report-data').textContent);
 const $=id=>document.getElementById(id);
+// Static reports embed their data; the live server supplies a source that loads it on demand
+const source=window.reportSource||embeddedSource();
+let data,firstDate,cutoffDate,modelOrder=[];
 const SLOTS=7;
 const metricDefs=[
     {key:'ttft',title:'Time to first token',short:'First token',unit:'s',desc:'Explicit first-token timing per completed turn',sample:'turn',chart:v=>v,axis:v=>`${trim(v)}s`,format:v=>seconds(v)},
@@ -2297,8 +2302,7 @@ const metricDefs=[
 const chartStats=[['avg','Average','var(--s1)'],['median','Median','var(--s2)'],['p75','P75','var(--s3)'],['p95','P95','var(--s7)'],['p99','P99','var(--s5)']];
 const statDefs=[['median','Median'],['avg','Average'],['p75','P75'],['p95','P95'],['p99','P99'],['min','Minimum'],['max','Maximum']];
 const distOrder=[['min','Min'],['median','Median'],['avg','Avg'],['p75','P75'],['p95','P95'],['p99','P99'],['max','Max']];
-const firstDate=data.trend_periods.daily[0].start.slice(0,10),cutoffDate=data.generated.slice(0,10);
-const state={window:0,harness:'',tier:'',model:'',mode:'',granularity:'daily',start:firstDate,end:cutoffDate,measure:'tokens',split:'none',stats:new Set(['median','p95']),compare:'model',statistic:'median',sort:'cost',dir:-1,usageTable:false,heatTable:false};
+const state={window:0,harness:'',tier:'',model:'',mode:'',granularity:'daily',start:'',end:'',measure:'tokens',split:'none',stats:new Set(['median','p95']),compare:'model',statistic:'median',sort:'cost',dir:-1,usageTable:false,heatTable:false};
 
 // Formatting
 const number=(n,d=2)=>Number(n).toLocaleString('en-US',{maximumFractionDigits:d});
@@ -2314,10 +2318,9 @@ function duration(s){if(s===null||s===undefined)return '—';s=Math.round(s);if(
 const day=(iso,opts)=>new Date(iso.slice(0,10)+'T00:00:00Z').toLocaleDateString('en-US',{...opts,timeZone:'UTC'});
 const fmtDate=value=>new Date(value).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:data.timezone});
 const fmtTime=value=>new Date(value).toLocaleString('en-US',{dateStyle:'medium',timeStyle:'short',timeZone:data.timezone});
-const hourCounts=new Map();for(const p of data.trend_periods.hourly)hourCounts.set(p.label.slice(0,16),(hourCounts.get(p.label.slice(0,16))||0)+1);
 function periodLabel(period,granularity,long){
     const label=period.label;
-    if(granularity==='hourly'){const hour=label.slice(11,16),offset=hourCounts.get(label.slice(0,16))>1&&label.slice(16)?` (UTC${label.slice(16)})`:'';return long?`${day(label,{weekday:'short',month:'short',day:'numeric',year:'numeric'})} · ${hour}${offset}`:`${day(label,{month:'short',day:'numeric'})} ${hour}`}
+    if(granularity==='hourly'){const hour=label.slice(11,16),offset=period.repeat&&label.slice(16)?` (UTC${label.slice(16)})`:'';return long?`${day(label,{weekday:'short',month:'short',day:'numeric',year:'numeric'})} · ${hour}${offset}`:`${day(label,{month:'short',day:'numeric'})} ${hour}`}
     if(granularity==='weekly')return long?`Week of ${day(label,{month:'short',day:'numeric',year:'numeric'})}`:day(label,{month:'short',day:'numeric'});
     if(granularity==='monthly')return day(label,{month:long?'long':'short',year:'numeric'});
     return long?day(label,{weekday:'short',month:'short',day:'numeric',year:'numeric'}):day(label,{month:'short',day:'numeric'});
@@ -2427,15 +2430,31 @@ const activeWindows=()=>scopeWindows(filters());
 const hasActivity=windows=>windows&&windows.some(w=>w.conversations>0||w.total_tokens>0);
 const longest=windows=>windows[windows.length-1];
 
-function rangedPeriods(granularity){
-    const firstDay=data.trend_periods.daily.find(p=>p.start.slice(0,10)===state.start)||data.trend_periods.daily[0],rangeStart=Date.parse(firstDay.start);
-    return data.trend_periods[granularity].map((period,index)=>({period,index})).filter(({period})=>period.start.slice(0,10)<=state.end&&(Date.parse(period.end)>rangeStart||Date.parse(period.end)===rangeStart&&!period.end_exclusive));
+function embeddedSource(){return {live:false,load:async()=>JSON.parse($('report-data').textContent),series:async(scope,granularity,start,end)=>{
+    const daily=data.trend_periods.daily,firstDay=daily.find(p=>p.start.slice(0,10)===start)||daily[0],rangeStart=Date.parse(firstDay.start),trends=scopeTrends(scope,granularity);
+    const entries=data.trend_periods[granularity].map((period,index)=>({period,index})).filter(({period})=>period.start.slice(0,10)<=end&&(Date.parse(period.end)>rangeStart||Date.parse(period.end)===rangeStart&&!period.end_exclusive));
+    return {periods:entries.map(e=>e.period),points:entries.map(({index})=>trends?.[index]??null)}}}}
+// Periods overlapping the chosen dates; repeated daylight-saving hours keep their UTC offset in labels
+async function series(scope,granularity,start,end){
+    if(start<firstDate)start=firstDate;if(end>cutoffDate)end=cutoffDate;
+    if(start>end)return {periods:[],points:[]};
+    const result=await source.series(scope,granularity,start,end),counts=new Map(),hour=p=>p.label.slice(0,16);
+    if(granularity==='hourly'){for(const p of result.periods)counts.set(hour(p),(counts.get(hour(p))||0)+1);for(const p of result.periods)p.repeat=counts.get(hour(p))>1}
+    return result;
+}
+// Charts load asynchronously; only the latest request for each view may draw
+const tickets={};
+async function load(name,hosts,request,quiet){
+    const id=tickets[name]=(tickets[name]||0)+1;
+    for(const h of hosts){h.setAttribute('aria-busy','true');if(!h.firstChild&&!quiet)h.replaceChildren(text('div','Loading…','empty'))}
+    try{const result=await request();return id===tickets[name]?result:null}
+    catch(error){if(id===tickets[name])for(const h of hosts){mounted.delete(h);resizer.unobserve(h);if(quiet)h.remove();else h.replaceChildren(text('div',error.message||'Unable to load this chart.','empty'))}return null}
+    finally{if(id===tickets[name])for(const h of hosts)h.removeAttribute('aria-busy')}
 }
 const measureValue=(point,measure)=>point?(measure==='cost'?Number(point.cost||0):point.total_tokens):0;
 
 // Split entities keep their color across window and date changes
 // Models are ordered once by all-history tokens, so filters never repaint a model
-const modelOrder=Object.entries(data.by_model).map(([name,ws])=>[name,Math.max(...ws.map(w=>w.total_tokens))]).filter(([,t])=>t>0).sort((a,b)=>b[1]-a[1]).map(([name])=>name);
 const entityNames={model:()=>modelOrder,harness:()=>Object.keys(data.by_harness),tier:()=>Object.keys(data.by_tier),mode:()=>Object.keys(data.by_mode)};
 const entityColor=(dim,name)=>{const i=entityNames[dim]().indexOf(name);return i>=0&&i<SLOTS?`var(--s${i+1})`:'var(--other)'};
 function splitEntities(split){
@@ -2447,34 +2466,37 @@ function splitEntities(split){
 }
 
 // Usage over time
-function usageSeries(granularity,entries,measure){
-    const series=splitEntities(state.split).map(e=>{const trends=scopeTrends(e.scope,granularity);return {name:e.name,color:e.color,values:entries.map(({index})=>measureValue(trends?.[index],measure)),partial:entries.map(({index})=>!!trends?.[index]?.partial_cost)}}).filter(s=>state.split==='none'||s.values.some(v=>v>0));
+function usageSeries(entities,results,periods,measure){
+    const series=entities.map((e,k)=>{const points=results[k].points;return {name:e.name,color:e.color,values:points.map(p=>measureValue(p,measure)),partial:points.map(p=>!!p?.partial_cost)}}).filter(s=>state.split==='none'||s.values.some(v=>v>0));
     const named=series.filter(s=>s.color!=='var(--other)'),rest=series.filter(s=>s.color==='var(--other)');
-    if(rest.length>1){const kept=named;kept.push({name:`Other (${rest.length})`,color:'var(--other)',values:entries.map((_,i)=>rest.reduce((t,s)=>t+s.values[i],0)),partial:entries.map((_,i)=>rest.some(s=>s.partial[i]))});return kept}
+    if(rest.length>1){const kept=named;kept.push({name:`Other (${rest.length})`,color:'var(--other)',values:periods.map((_,i)=>rest.reduce((t,s)=>t+s.values[i],0)),partial:periods.map((_,i)=>rest.some(s=>s.partial[i]))});return kept}
     return series;
 }
-function usage(){
-    const g=state.granularity,entries=rangedPeriods(g),periods=entries.map(e=>e.period),measure=state.measure,isCost=measure==='cost';
+async function usage(){
+    const g=state.granularity,measure=state.measure,isCost=measure==='cost',entities=splitEntities(state.split),start=state.start,end=state.end;
     const per={hourly:'hour',daily:'day',weekly:'week',monthly:'month'}[g];
     $('usage-title').textContent=`${isCost?'Estimated cost':'Tokens'} per ${per}`;
     $('usage-desc').textContent=isCost?'API-equivalent USD estimate per period at current rates':'Input plus output tokens per period · includes cached input and reasoning';
-    const series=usageSeries(g,entries,measure),total=series.reduce((t,s)=>t+s.values.reduce((a,b)=>a+b,0),0),fmt=isCost?money:v=>integer(v);
-    $('usage-legend').replaceChildren(...(series.length>1?series.map(s=>{const l=text('span',s.name);l.prepend(key(s.color));return l}):[]));
-    const partial=entries.map((_,i)=>series.some(s=>s.partial[i]));
-    mount($('usage-chart'),timeChart({periods,granularity:g,series,kind:'bars',stacked:true,label:`${$('usage-title').textContent}, ${state.start} to ${state.end}`,format:isCost?money:v=>integer(v),axis:isCost?moneyAxis:compact,note:i=>partial[i]?'Partial estimate · some usage lacks a rate':'',empty:'No recorded usage in this range.'}));
-    const peak=series.length?periods.map((_,i)=>series.reduce((t,s)=>t+s.values[i],0)).reduce((best,v,i,a)=>v>a[best]?i:best,0):-1;
-    $('trend-caption').textContent=`${day(state.start,{month:'short',day:'numeric',year:'numeric'})} – ${day(state.end,{month:'short',day:'numeric',year:'numeric'})} · ${fmt(total)} ${isCost?'estimated':'tokens'} across ${integer(periods.length)} ${per}${periods.length===1?'':'s'}${peak>=0&&total>0?` · busiest ${per}: ${periodLabel(periods[peak],g,true)}`:''}`;
+    const results=await load('usage',[$('usage-chart')],()=>Promise.all(entities.map(e=>series(e.scope,g,start,end))));
+    if(!results)return;
+    const periods=results[0]?.periods||[],lines=usageSeries(entities,results,periods,measure),total=lines.reduce((t,s)=>t+s.values.reduce((a,b)=>a+b,0),0),fmt=isCost?money:v=>integer(v);
+    $('usage-legend').replaceChildren(...(lines.length>1?lines.map(s=>{const l=text('span',s.name);l.prepend(key(s.color));return l}):[]));
+    const partial=periods.map((_,i)=>lines.some(s=>s.partial[i]));
+    mount($('usage-chart'),timeChart({periods,granularity:g,series:lines,kind:'bars',stacked:true,label:`${$('usage-title').textContent}, ${start} to ${end}`,format:isCost?money:v=>integer(v),axis:isCost?moneyAxis:compact,note:i=>partial[i]?'Partial estimate · some usage lacks a rate':'',empty:'No recorded usage in this range.'}));
+    const peak=lines.length?periods.map((_,i)=>lines.reduce((t,s)=>t+s.values[i],0)).reduce((best,v,i,a)=>v>a[best]?i:best,0):-1;
+    $('trend-caption').textContent=`${day(start,{month:'short',day:'numeric',year:'numeric'})} – ${day(end,{month:'short',day:'numeric',year:'numeric'})} · ${fmt(total)} ${isCost?'estimated':'tokens'} across ${integer(periods.length)} ${per}${periods.length===1?'':'s'}${peak>=0&&total>0?` · busiest ${per}: ${periodLabel(periods[peak],g,true)}`:''}`;
     const tableHost=$('usage-table');tableHost.replaceChildren(toggleButton('usageTable',()=>usage()));
-    if(state.usageTable){const wrap=text('div','','data-table'),t=document.createElement('table');table(t,['Period',...series.map(s=>s.name),...(series.length>1?['Total']:[])],periods.map((p,i)=>[periodLabel(p,g,true),...series.map(s=>fmt(s.values[i])),...(series.length>1?[fmt(series.reduce((a,s)=>a+s.values[i],0))]:[])]));wrap.append(t);tableHost.append(wrap)}
-    heatmap();
+    if(state.usageTable){const wrap=text('div','','data-table'),t=document.createElement('table');table(t,['Period',...lines.map(s=>s.name),...(lines.length>1?['Total']:[])],periods.map((p,i)=>[periodLabel(p,g,true),...lines.map(s=>fmt(s.values[i])),...(lines.length>1?[fmt(lines.reduce((a,s)=>a+s.values[i],0))]:[])]));wrap.append(t);tableHost.append(wrap)}
 }
 function toggleButton(flag,rerender){const b=text('button',state[flag]?'Hide data table':'Show data table','link-btn view-toggle');b.type='button';b.setAttribute('aria-expanded',state[flag]);b.style.marginTop='10px';b.addEventListener('click',()=>{state[flag]=!state[flag];rerender()});return b}
 
 // Weekday × hour heatmap of hourly tokens in the chosen range
 const weekdays=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-function heatmap(){
-    const entries=rangedPeriods('hourly'),trends=scopeTrends(filters(),'hourly')||[],grid=weekdays.map(()=>new Array(24).fill(0));
-    for(const {period,index} of entries){const v=trends[index]?.total_tokens||0;if(!v)continue;const d=(new Date(period.label.slice(0,10)+'T00:00:00Z').getUTCDay()+6)%7;grid[d][Number(period.label.slice(11,13))]+=v}
+async function heatmap(){
+    const result=await load('heatmap',[$('heat-chart')],()=>series(filters(),'hourly',state.start,state.end));
+    if(!result)return;
+    const grid=weekdays.map(()=>new Array(24).fill(0));
+    for(const [index,period] of result.periods.entries()){const v=result.points[index]?.total_tokens||0;if(!v)continue;const d=(new Date(period.label.slice(0,10)+'T00:00:00Z').getUTCDay()+6)%7;grid[d][Number(period.label.slice(11,13))]+=v}
     const max=Math.max(0,...grid.flat()),total=grid.flat().reduce((a,b)=>a+b,0);
     let best=[0,0];grid.forEach((row,d)=>row.forEach((v,h)=>{if(v>grid[best[0]][best[1]])best=[d,h]}));
     $('heat-desc').textContent=total?`Tokens by weekday and hour (${data.timezone}) · peak ${weekdays[best[0]]} ${String(best[1]).padStart(2,'0')}:00 with ${percent(grid[best[0]][best[1]],total)} of usage`:'Tokens by weekday and hour of the report timezone';
@@ -2496,8 +2518,8 @@ function heatmap(){
 }
 
 // Performance distributions
-function performance(w){
-    const entries=rangedPeriods(state.granularity),periods=entries.map(e=>e.period),trends=scopeTrends(filters(),state.granularity)||[],shown=chartStats.filter(([s])=>state.stats.has(s));
+async function performance(w){
+    const granularity=state.granularity,shown=chartStats.filter(([s])=>state.stats.has(s)),charts=[];
     $('performance').replaceChildren();
     for(const def of metricDefs){
         const m=w.metrics[def.key],card=text('article','','card'),head=text('div','','card-head'),h=text('div');h.append(text('h3',def.title),text('p',def.desc));head.append(h);card.append(head);
@@ -2506,20 +2528,25 @@ function performance(w){
         const chart=text('div','','chart');card.append(chart);
         const dist=text('dl','','dist');for(const [stat,label] of distOrder){const d=text('div');d.append(text('dt',label),text('dd',m[stat]===null?'—':def.format(m[stat])));dist.append(d)}
         card.append(dist,text('p',`${integer(m.count)} valid ${def.sample} sample${m.count===1?'':'s'} in ${data.windows[state.window].label.toLowerCase()}`,'samples'));
-        $('performance').append(card);
-        const series=shown.map(([stat,label,color])=>({name:label,color,values:entries.map(({index})=>{const v=trends[index]?.[def.key]?.[stat];return v===null||v===undefined?null:def.chart(v)})}));
-        mount(chart,shown.length?timeChart({periods,granularity:state.granularity,series,kind:'lines',height:200,label:`${def.title} by ${state.granularity} period`,axis:def.axis,format:v=>def.format(def.key==='length'?v*60:v),note:i=>{const c=trends[entries[i].index]?.[def.key]?.count;return c?`${integer(c)} ${def.sample} sample${c===1?'':'s'}`:'No samples'},empty:'No valid samples in this range.'}):()=>text('div','Select a statistic above to draw the trend.','empty'));
+        $('performance').append(card);charts.push([chart,def]);
+    }
+    if(!shown.length){for(const [chart] of charts)mount(chart,()=>text('div','Select a statistic above to draw the trend.','empty'));return}
+    const result=await load('performance',charts.map(([chart])=>chart),()=>series(filters(),granularity,state.start,state.end));
+    if(!result)return;
+    const {periods,points}=result;
+    for(const [chart,def] of charts){
+        const lines=shown.map(([stat,label,color])=>({name:label,color,values:points.map(p=>{const v=p?.[def.key]?.[stat];return v===null||v===undefined?null:def.chart(v)})}));
+        mount(chart,timeChart({periods,granularity,series:lines,kind:'lines',height:200,label:`${def.title} by ${granularity} period`,axis:def.axis,format:v=>def.format(def.key==='length'?v*60:v),note:i=>{const c=points[i]?.[def.key]?.count;return c?`${integer(c)} ${def.sample} sample${c===1?'':'s'}`:'No samples'},empty:'No valid samples in this range.'}));
     }
 }
 
 // Summary tiles with sparklines over the selected window
-function windowSpark(w,measure){
-    const hourly=['Today','Yesterday'].includes(data.windows[state.window].label),granularity=hourly?'hourly':'daily',start=Date.parse(w.start),end=Date.parse(w.end);
-    const entries=data.trend_periods[granularity].map((period,index)=>({period,index})).filter(({period})=>Date.parse(period.end)>start&&Date.parse(period.start)<(w.end_exclusive?end:end+1));
-    const trends=scopeTrends(filters(),granularity)||[];
-    return {periods:entries.map(e=>e.period),granularity,values:entries.map(({index})=>measure(trends[index]))};
+// Today and Yesterday use hourly points; longer windows use the days they overlap
+function windowSpark(w){
+    const hourly=['Today','Yesterday'].includes(data.windows[state.window].label),granularity=hourly?'hourly':'daily',start=w.start.slice(0,10);
+    return {granularity,request:()=>series(filters(),granularity,start,hourly?start:w.end.slice(0,10))};
 }
-function cards(w){
+async function cards(w){
     const tools=w.metrics.tools,activeShare=w.conversations?w.tool_calls/w.conversations:0;
     const items=[
         {label:'Estimated cost',value:money(w.cost),note:w.partial_cost?'Partial · some usage unpriced':'USD · API-equivalent',spark:p=>p?Number(p.cost):0,fmt:money},
@@ -2527,12 +2554,16 @@ function cards(w){
         {label:'Conversations',value:integer(w.conversations),note:'Active threads incl. subagents',spark:p=>p?p.tools.count:0,fmt:integer},
         {label:'Active time',value:duration(w.active_seconds),note:'Completed turn durations, summed',spark:p=>p&&p.length.avg!==null?p.length.avg*p.length.count:0,fmt:duration},
         {label:'Tool calls',value:integer(w.tool_calls),note:w.conversations?`${number(activeShare,1)} per conversation`:'Model-issued calls',spark:p=>p&&p.tools.avg!==null?Math.round(p.tools.avg*p.tools.count):0,fmt:integer}];
-    $('cards').replaceChildren();
+    $('cards').replaceChildren();const sparks=[];
     for(const item of items){
         const c=text('article','','card kpi');c.append(text('div',item.label,'kpi-label'),text('div',item.value,'kpi-value'),text('div',item.note,'kpi-note'));
         if(item.split){const dl=text('dl','','kpi-split');for(const [name,count] of item.split){const row=text('div');row.append(text('dt',name),text('dd',compact(count)));row.title=`${name}: ${integer(count)} tokens`;dl.append(row)}c.append(dl)}
-        const s=windowSpark(w,item.spark),spark=text('div','','chart spark');c.append(spark);$('cards').append(c);
-        if(s.periods.length>1)mount(spark,timeChart({periods:s.periods,granularity:s.granularity,series:[{name:item.label,color:'var(--accent)',values:s.values}],kind:'lines',area:true,spark:true,label:`${item.label} per ${s.granularity==='hourly'?'hour':'day'}`,format:item.fmt}));
+        const spark=text('div','','chart spark');c.append(spark);$('cards').append(c);sparks.push([spark,item]);
+    }
+    const s=windowSpark(w),result=await load('cards',sparks.map(([spark])=>spark),s.request,true);
+    if(!result)return;
+    for(const [spark,item] of sparks){
+        if(result.periods.length>1)mount(spark,timeChart({periods:result.periods,granularity:s.granularity,series:[{name:item.label,color:'var(--accent)',values:result.points.map(item.spark)}],kind:'lines',area:true,spark:true,label:`${item.label} per ${s.granularity==='hourly'?'hour':'day'}`,format:item.fmt}));
         else spark.remove();
     }
 }
@@ -2671,52 +2702,64 @@ function render(){
     const damaged=Object.keys(data.quality).some(k=>k.startsWith('Malformed')||k==='Unreadable files'||k==='Invalid usage records');
     const notice=$('notice');notice.hidden=!w.partial_cost&&!damaged;notice.replaceChildren(text('span','⚠'),text('span'));
     notice.lastChild.append(text('b',w.partial_cost?'Partial cost estimate. ':'Some records could not be read. '),document.createTextNode(w.partial_cost?`${integer(w.unpriced_tokens)} tokens lack a verified rate or the category detail needed to calculate cost. Their usage is included in token totals.`:'Review parser diagnostics under Data quality.'));
-    cards(w);usage();performance(w);composition(w);comparison();quality(w);exactMetrics();saveState();
+    cards(w);usage();heatmap();performance(w);composition(w);comparison();quality(w);exactMetrics();saveState();
     document.title=`${win.label} · Coding agents usage report`;
 }
 
-// Static controls
-data.windows.forEach((w,i)=>{const b=text('button',w.label.replace(/^Last /,''));b.type='button';b.title=w.label;b.addEventListener('click',()=>{state.window=i;render()});$('tabs').append(b)});
+// Controls that do not depend on report data
 for(const [stat,label,color] of chartStats){
     const option=text('label',''),input=document.createElement('input');input.type='checkbox';input.value=stat;input.checked=state.stats.has(stat);
     option.append(input,key(color,true),document.createTextNode(label));$('trend-stat-options').append(option);
-    input.addEventListener('change',()=>{if(input.checked)state.stats.add(stat);else state.stats.delete(stat);performance(activeWindows()[state.window]);saveState()});
+    input.addEventListener('change',()=>{if(input.checked)state.stats.add(stat);else state.stats.delete(stat);if(data){performance(activeWindows()[state.window]);saveState()}});
 }
-for(const [value,label] of [['tokens','Tokens'],['cost','Cost']]){const b=text('button',label);b.type='button';b.dataset.value=value;b.addEventListener('click',()=>{state.measure=value;syncMeasure();usage();saveState()});$('usage-metric').append(b)}
+for(const [value,label] of [['tokens','Tokens'],['cost','Cost']]){const b=text('button',label);b.type='button';b.dataset.value=value;b.addEventListener('click',()=>{state.measure=value;syncMeasure();if(data){usage();saveState()}});$('usage-metric').append(b)}
 const syncMeasure=()=>[...$('usage-metric').children].forEach(b=>b.setAttribute('aria-pressed',b.dataset.value===state.measure));
-for(const [value,label] of compareDims){const b=text('button',label);b.type='button';b.dataset.value=value;b.addEventListener('click',()=>{state.compare=value;syncCompare();comparison();saveState()});$('compare-dimension').append(b)}
+for(const [value,label] of compareDims){const b=text('button',label);b.type='button';b.dataset.value=value;b.addEventListener('click',()=>{state.compare=value;syncCompare();if(data){comparison();saveState()}});$('compare-dimension').append(b)}
 const syncCompare=()=>[...$('compare-dimension').children].forEach(b=>b.setAttribute('aria-pressed',b.dataset.value===state.compare));
 for(const [stat,label] of statDefs){const option=text('option',label);option.value=stat;$('comparison-stat-select').append(option)}
-$('comparison-stat-select').addEventListener('change',()=>{state.statistic=$('comparison-stat-select').value;comparison();saveState()});
-$('split-select').addEventListener('change',()=>{state.split=$('split-select').value;usage();saveState()});
+$('comparison-stat-select').addEventListener('change',()=>{state.statistic=$('comparison-stat-select').value;if(data){comparison();saveState()}});
+$('split-select').addEventListener('change',()=>{state.split=$('split-select').value;if(data){usage();saveState()}});
 for(const id of ['trend-start','trend-end']){
-    const input=$(id);input.min=firstDate;input.max=cutoffDate;
-    input.addEventListener('change',()=>{
+    $(id).addEventListener('change',()=>{
+        if(!data)return;
         const start=$('trend-start'),end=$('trend-end'),error=$('trend-range-error');
         error.hidden=start.validity.valid&&end.validity.valid&&start.value<=end.value;
         if(!error.hidden){error.textContent=`Choose dates from ${firstDate} to ${cutoffDate}, with From on or before To.`;return}
-        state.start=start.value;state.end=end.value;usage();performance(activeWindows()[state.window]);saveState();
+        state.start=start.value;state.end=end.value;usage();heatmap();performance(activeWindows()[state.window]);saveState();
     });
 }
-$('granularity-select').addEventListener('change',()=>{state.granularity=$('granularity-select').value;usage();performance(activeWindows()[state.window]);saveState()});
+$('granularity-select').addEventListener('change',()=>{state.granularity=$('granularity-select').value;if(data){usage();performance(activeWindows()[state.window]);saveState()}});
 $('expand-defs').addEventListener('click',()=>{const all=[...$('definitions').querySelectorAll('details')],open=!all.every(d=>d.open);all.forEach(d=>d.open=open);$('expand-defs').textContent=open?'Collapse all':'Expand all'});
 const themes=['system','light','dark'];let theme='system';try{theme=localStorage.getItem('harness-report-theme')||'system'}catch(error){}
 const applyTheme=()=>{if(theme==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=theme;$('theme-toggle').textContent=`Theme: ${theme[0].toUpperCase()+theme.slice(1)}`};
 $('theme-toggle').addEventListener('click',()=>{theme=themes[(themes.indexOf(theme)+1)%themes.length];try{localStorage.setItem('harness-report-theme',theme)}catch(error){}applyTheme()});applyTheme();
 addEventListener('scroll',hideTip,{passive:true});
 
-$('subtitle').textContent=`${integer(data.files)} log files · ${integer(data.threads)} threads · ${data.timezone} · cutoff ${fmtTime(data.generated)}`;
-$('pricing-date').textContent=`Pricing verified ${data.pricing_date}`;
-table($('diagnostics'),['Diagnostic','Count'],Object.entries(data.quality).map(([k,v])=>[k,integer(v)]),{empty:'No parser issues recorded.'});data.warnings.forEach(w=>$('warnings').append(text('li',w)));
-$('sources').append(document.createTextNode(`Rates verified ${data.pricing_date}: `));const link=text('a','OpenAI API pricing');link.href=data.pricing_source;link.rel='noreferrer';$('sources').append(link,document.createTextNode('. Rates are embedded in the script and are not updated automatically. Input directories: '+data.sources.join(', ')));
-const anthropicLink=text('a','Anthropic API pricing');anthropicLink.href=data.anthropic_pricing_source;anthropicLink.rel='noreferrer';$('sources').append(document.createTextNode(` · Anthropic verified ${data.anthropic_pricing_date}: `),anthropicLink);if(data.openrouter){const routerLink=text('a','OpenRouter model catalog');routerLink.href=data.openrouter.source;routerLink.rel='noreferrer';const origin=data.openrouter.bundled?' · bundled snapshot':data.openrouter.snapshot_file?' · supplied snapshot':' · live catalog';const date=data.openrouter.retrieved?` retrieved ${fmtTime(data.openrouter.retrieved)}`:' (retrieval date unknown)';const error=data.openrouter.error?` · live fetch unavailable: ${data.openrouter.error}; using ${data.openrouter.bundled?'bundled':'supplied snapshot'} prices`:'';$('sources').append(document.createTextNode(' · '),routerLink,document.createTextNode(origin+date+error));}
-$('sources').append(document.createTextNode(' · '));const modeLink=text('a','Fast mode documentation');modeLink.href='https://developers.openai.com/api/docs/guides/fast-mode';modeLink.rel='noreferrer';$('sources').append(modeLink);
-$('footer').textContent=`Report cutoff: ${fmtTime(data.generated)} (${data.timezone})`;
-
-loadState();
-$('trend-start').value=state.start;$('trend-end').value=state.end;$('granularity-select').value=state.granularity;$('split-select').value=state.split;$('comparison-stat-select').value=state.statistic;
-[...$('trend-stat-options').querySelectorAll('input')].forEach(i=>{i.checked=state.stats.has(i.value)});
-syncMeasure();syncCompare();render();
+async function start(){
+    try{data=await source.load()}
+    catch(error){
+        $('subtitle').textContent='Report data is unavailable.';
+        const notice=$('notice');notice.hidden=false;notice.replaceChildren(text('span','⚠'),text('span'));notice.lastChild.append(text('b','Unable to load the report. '),document.createTextNode(error.message||'Check that the local server is running.'));
+        return;
+    }
+    firstDate=data.first_date||data.trend_periods.daily[0].start.slice(0,10);cutoffDate=data.cutoff_date||data.generated.slice(0,10);state.start=firstDate;state.end=cutoffDate;
+    // Models are ordered once by all-history tokens, so filters never repaint a model
+    modelOrder=Object.entries(data.by_model).map(([name,ws])=>[name,Math.max(...ws.map(w=>w.total_tokens))]).filter(([,t])=>t>0).sort((a,b)=>b[1]-a[1]).map(([name])=>name);
+    data.windows.forEach((w,i)=>{const b=text('button',w.label.replace(/^Last /,''));b.type='button';b.title=w.label;b.addEventListener('click',()=>{state.window=i;render()});$('tabs').append(b)});
+    for(const id of ['trend-start','trend-end']){$(id).min=firstDate;$(id).max=cutoffDate}
+    $('subtitle').textContent=`${integer(data.files)} log files · ${integer(data.threads)} threads · ${data.timezone} · cutoff ${fmtTime(data.generated)}`;
+    $('pricing-date').textContent=`Pricing verified ${data.pricing_date}`;
+    table($('diagnostics'),['Diagnostic','Count'],Object.entries(data.quality).map(([k,v])=>[k,integer(v)]),{empty:'No parser issues recorded.'});data.warnings.forEach(w=>$('warnings').append(text('li',w)));
+    $('sources').append(document.createTextNode(`Rates verified ${data.pricing_date}: `));const link=text('a','OpenAI API pricing');link.href=data.pricing_source;link.rel='noreferrer';$('sources').append(link,document.createTextNode(`. Rates are embedded in the script and are not updated automatically. ${source.live?'Cached source locations':'Input directories'}: `+data.sources.join(', ')));
+    const anthropicLink=text('a','Anthropic API pricing');anthropicLink.href=data.anthropic_pricing_source;anthropicLink.rel='noreferrer';$('sources').append(document.createTextNode(` · Anthropic verified ${data.anthropic_pricing_date}: `),anthropicLink);if(data.openrouter){const routerLink=text('a','OpenRouter model catalog');routerLink.href=data.openrouter.source;routerLink.rel='noreferrer';const origin=data.openrouter.bundled?' · bundled snapshot':data.openrouter.snapshot_file?' · supplied snapshot':' · live catalog';const date=data.openrouter.retrieved?` retrieved ${fmtTime(data.openrouter.retrieved)}`:' (retrieval date unknown)';const error=data.openrouter.error?` · live fetch unavailable: ${data.openrouter.error}; using ${data.openrouter.bundled?'bundled':'supplied snapshot'} prices`:'';$('sources').append(document.createTextNode(' · '),routerLink,document.createTextNode(origin+date+error));}
+    $('sources').append(document.createTextNode(' · '));const modeLink=text('a','Fast mode documentation');modeLink.href='https://developers.openai.com/api/docs/guides/fast-mode';modeLink.rel='noreferrer';$('sources').append(modeLink);
+    $('footer').textContent=`Report cutoff: ${fmtTime(data.generated)} (${data.timezone})`;
+    loadState();
+    $('trend-start').value=state.start;$('trend-end').value=state.end;$('granularity-select').value=state.granularity;$('split-select').value=state.split;$('comparison-stat-select').value=state.statistic;
+    [...$('trend-stat-options').querySelectorAll('input')].forEach(i=>{i.checked=state.stats.has(i.value)});
+    syncMeasure();syncCompare();render();
+}
+start();
 </script></body></html>
 '''
 
