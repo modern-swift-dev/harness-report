@@ -57,7 +57,6 @@ class Distribution(BaseModel):
 
 
 class MetricSummary(BaseModel):
-    ttft: Distribution
     throughput: Distribution
     length: Distribution
     tools: Distribution

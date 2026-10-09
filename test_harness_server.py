@@ -216,7 +216,7 @@ class ServerTests(unittest.TestCase):
                                      windows[-1]['total_tokens'])
         timing = self.service.trends(self.metadata.snapshot, self.metadata.first_date, self.metadata.cutoff_date,
                                      metrics.Granularity.DAILY, scopes[-2])
-        self.assertEqual(sum(point.ttft.count for point in timing.points if point), 1)
+        self.assertEqual(sum(point.throughput.count for point in timing.points if point), 1)
 
     def test_series_batch_matches_static_trends_in_one_database_pass(self):
         report = self.static_report()
@@ -297,7 +297,7 @@ class ServerTests(unittest.TestCase):
             if interval == metrics.Granularity.HOURLY:
                 self.assertEqual(len(actual.points), 24)
             if interval == metrics.Granularity.MONTHLY:
-                self.assertEqual(actual.points[0].ttft.count, report['trends']['monthly'][0]['ttft']['count'])
+                self.assertEqual(actual.points[0].throughput.count, report['trends']['monthly'][0]['throughput']['count'])
 
     def test_selected_model_resets_if_new_scope_has_no_tokens(self):
         result = self.service.dashboard(self.metadata.snapshot, server.ReportWindow.YESTERDAY,
