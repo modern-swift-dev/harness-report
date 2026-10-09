@@ -198,7 +198,6 @@ Fast usage has its own model entry with a `-fast` suffix, such as `gpt-6.1-sol-f
 Requests crossing a model's context-pricing threshold have a `-long` suffix, such as `gpt-6.1-sol-long`; Fast requests above the threshold use `gpt-6.1-sol-fast-long`. Thresholds use total input, including cached input, and follow embedded model prices or matched OpenRouter context overrides. Models without context pricing and aggregate records lacking per-request sizes keep their original names. Aggregate records use normal-context rates without long-context surcharges or OpenRouter context overrides; recorded speed-mode premiums still apply where known. This assumption can underestimate actual long-context costs. Tokens and costs follow each request. A turn mixing context classes for one model and mode keeps shared timing under **Mixed contexts (timing)**. Tool calls follow matching turn usage when it has one context class; ambiguous calls appear under **Mixed contexts (tools)**. Mode and tier totals retain this activity once.
 
 - **Today and Yesterday** follow the report timezone. Rolling windows cover exact 24-hour days.
-- **First-token time** requires explicit logged timing; missing samples are excluded.
 - **Effective throughput** divides output tokens, including reasoning, by full turn duration, including tool execution and waiting.
 - **Active duration** sums completed turn durations; concurrent activity can overlap.
 - **Conversation counts** include subagents and can overlap across models, tiers, and modes.

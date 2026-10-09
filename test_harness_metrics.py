@@ -52,8 +52,7 @@ def legacy(counts, at=START + timedelta(seconds=1), last=None):
 
 
 def complete(turn="t1", at=START + timedelta(seconds=10), **fields):
-    return event("task_complete", at, turn_id=turn, duration_ms=10_000,
-                 time_to_first_token_ms=500, **fields)
+    return event("task_complete", at, turn_id=turn, duration_ms=10_000, **fields)
 
 
 class ReportTests(unittest.TestCase):
@@ -86,7 +85,7 @@ class ReportTests(unittest.TestCase):
         self.write(prefix() + [modern(), complete()])
         w = self.report()["windows"][0]
         self.assertEqual(w["total_tokens"], 1100)
-        self.assertEqual(w["metrics"]["ttft"]["avg"], .5)
+        self.assertEqual(set(w["metrics"]), {"throughput", "length", "tools"})
         self.assertEqual(w["metrics"]["throughput"]["avg"], 10)
         self.assertEqual(w["metrics"]["length"]["avg"], 10)
         self.assertEqual(w["metrics"]["tools"]["avg"], 0)
@@ -222,7 +221,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(w["tool_calls"], 4)
         self.assertEqual(w["metrics"]["tools"]["avg"], 4)
         self.assertEqual(w["total_tokens"], 1100)
-        self.assertEqual(w["metrics"]["ttft"]["count"], 1)
+        self.assertEqual(w["metrics"]["throughput"]["count"], 1)
 
     def test_archived_and_live_copies_merge_new_turns_without_double_counting(self):
         original = prefix() + [modern(),
@@ -239,7 +238,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(w["total_tokens"], 2200)
         self.assertEqual(w["tool_calls"], 2)
         self.assertEqual(w["active_seconds"], 20)
-        self.assertEqual(w["metrics"]["ttft"]["count"], 2)
+        self.assertEqual(w["metrics"]["throughput"]["count"], 2)
         self.assertEqual(Decimal(w["cost"]), Decimal(".00448"))
         self.assertEqual(r["by_tier"]["Medium"]["windows"][0]["total_tokens"], 2200)
         self.assertEqual(r["sources"], [str((self.root / "archive").resolve()), str((self.root / "sessions").resolve())])
@@ -253,7 +252,7 @@ class ReportTests(unittest.TestCase):
         r = metrics.collect_report(self.root / "archive", NOW, additional_roots=[self.root / "sessions"])
         self.assertEqual(r["windows"][0]["total_tokens"], 2200)
         self.assertEqual(r["windows"][0]["coverage"]["Usage responses"], 2)
-        self.assertEqual(r["windows"][0]["metrics"]["ttft"]["count"], 2)
+        self.assertEqual(r["windows"][0]["metrics"]["throughput"]["count"], 2)
         self.assertEqual(r["threads"], 1)
 
     def test_live_unfinished_turn_contributes_usage_and_calls(self):
@@ -267,7 +266,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(w["conversations"], 2)
         self.assertEqual(w["total_tokens"], 2200)
         self.assertEqual(w["tool_calls"], 1)
-        self.assertEqual(w["metrics"]["ttft"]["count"], 1)
+        self.assertEqual(w["metrics"]["throughput"]["count"], 1)
         self.assertEqual(w["active_seconds"], 10)
         self.assertEqual(w["coverage"]["Unfinished turns"], 1)
         self.assertEqual(Decimal(r["by_tier"]["Budget"]["by_mode"]["Fast"]["windows"][0]["cost"]), Decimal(".000372"))
@@ -502,7 +501,6 @@ class ReportTests(unittest.TestCase):
             event("task_started", START + timedelta(seconds=30), turn_id="t3"), modern("t3", "r3")])
         w = self.report()["windows"][0]
         self.assertEqual(w["total_tokens"], 3300)
-        self.assertIsNone(w["metrics"]["ttft"]["avg"])
         self.assertEqual(w["metrics"]["length"]["avg"], 10)
         self.assertEqual(w["metrics"]["throughput"]["count"], 1)
         self.assertEqual(w["coverage"]["Aborted turns"], 1)
@@ -578,7 +576,7 @@ class ReportTests(unittest.TestCase):
                         self.assertEqual(Decimal(window["cost"]), sum(costs.values()))
                         self.assertEqual(window["tool_calls"], 1)
                         self.assertEqual(window["active_seconds"], 10)
-                        self.assertEqual(window["metrics"]["ttft"]["count"], 1)
+                        self.assertEqual(window["metrics"]["throughput"]["count"], 1)
                         self.assertEqual(window["models"], {name: tokens})
                         self.assertEqual(group["by_mode"][speed.value]["by_model"][name][0], window)
                     for i, total in enumerate(group["windows"]):
@@ -605,10 +603,10 @@ class ReportTests(unittest.TestCase):
                     window = group["by_model"][model][0]
                     self.assertEqual(window["active_seconds"], 0)
                     self.assertEqual(window["tool_calls"], 0)
-                    self.assertEqual(window["metrics"]["ttft"]["count"], 0)
+                    self.assertEqual(window["metrics"]["throughput"]["count"], 0)
                 timing = group["by_model"]["Mixed contexts (timing)"][0]
                 self.assertEqual(timing["active_seconds"], 10)
-                self.assertEqual(timing["metrics"]["ttft"]["count"], 1)
+                self.assertEqual(timing["metrics"]["throughput"]["count"], 1)
                 self.assertEqual(timing["metrics"]["throughput"]["avg"], 20)
                 self.assertEqual(timing["total_tokens"], 0)
                 self.assertEqual(group["by_model"]["Mixed contexts (tools)"][0]["tool_calls"], 1)
@@ -736,15 +734,15 @@ class ReportTests(unittest.TestCase):
         starts = [datetime(2026, 10, day, 10, tzinfo=timezone.utc) for day in (5, 6)]
         turns = {}
         calls = {}
-        for index, (start, duration, ttft) in enumerate(zip(starts, (10, 30), (1, 3))):
+        for index, (start, duration) in enumerate(zip(starts, (10, 30))):
             turn = metrics.Turn(str(index), start=start, end=start + timedelta(seconds=duration),
-                                duration=duration, ttft=ttft, model="gpt-6.1-sol", completed=True,
+                                duration=duration, model="gpt-6.1-sol", completed=True,
                                 modern=[metrics.UsageEvent(start, metrics.Usage(100, 100),
                                                            "gpt-6.1-sol", str(index))])
             turns[turn.id] = turn
             calls[str(index)] = metrics.ToolCall(start, turn.id, turn.model)
         other = metrics.Turn("other", start=starts[1], end=starts[1] + timedelta(seconds=20),
-                             duration=20, ttft=5, model="gpt-6-astra", completed=True,
+                             duration=20, model="gpt-6-astra", completed=True,
                              mode=metrics.SpeedMode.FAST,
                              modern=[metrics.UsageEvent(starts[1], metrics.Usage(100, 100),
                                                         "gpt-6-astra", "other", mode=metrics.SpeedMode.FAST)])
@@ -757,20 +755,19 @@ class ReportTests(unittest.TestCase):
             return scope["trends"][granularity][index]
 
         weekly = point(report, "weekly", "2026-10-05")
-        self.assertEqual(weekly["ttft"]["count"], 3)
-        self.assertEqual(weekly["ttft"]["avg"], 3)
+        self.assertEqual(weekly["throughput"]["count"], 3)
         self.assertEqual(weekly["length"]["avg"], 30)
         self.assertEqual(weekly["tools"]["avg"], 1)
         self.assertAlmostEqual(weekly["throughput"]["avg"], (10 + 100 / 30 + 5) / 3)
-        self.assertEqual(point(report, "daily", "2026-10-06")["ttft"]["avg"], 4)
-        self.assertEqual(point(report, "hourly", "2026-10-06T10:00+00:00")["ttft"]["avg"], 4)
+        self.assertAlmostEqual(point(report, "daily", "2026-10-06")["throughput"]["avg"], (100 / 30 + 5) / 2)
+        self.assertAlmostEqual(point(report, "hourly", "2026-10-06T10:00+00:00")["throughput"]["avg"], (100 / 30 + 5) / 2)
         self.assertEqual(point(report, "monthly", "2026-10-01")["length"]["avg"], 30)
         self.assertIsNone(point(report, "daily", "2026-10-07"))
         normal = report["by_mode"]["Normal"]
         self.assertEqual(point(normal, "weekly", "2026-10-05")["length"]["avg"], 40)
         high_fast = report["by_tier"]["High"]["by_mode"]["Fast"]
-        self.assertEqual(point(high_fast, "weekly", "2026-10-05")["ttft"]["avg"], 5)
-        self.assertEqual(point(high_fast, "hourly", "2026-10-06T10:00+00:00")["ttft"]["avg"], 5)
+        self.assertEqual(point(high_fast, "weekly", "2026-10-05")["throughput"]["avg"], 5)
+        self.assertEqual(point(high_fast, "hourly", "2026-10-06T10:00+00:00")["throughput"]["avg"], 5)
         index = next(i for i, p in enumerate(report["trend_periods"]["weekly"])
                      if p["label"] == "2026-10-05")
         self.assertEqual(normal["by_model_trends"]["gpt-6.1-sol"]["weekly"][index]["tools"]["avg"], 2)
@@ -779,7 +776,7 @@ class ReportTests(unittest.TestCase):
         boundary = datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
         start = boundary - timedelta(minutes=2)
         turn = metrics.Turn("crossing", start=start, end=boundary, completed=True,
-                            duration=120, ttft=2, model="gpt-6.1-sol",
+                            duration=120, model="gpt-6.1-sol",
                             modern=[metrics.UsageEvent(start, metrics.Usage(100, 240),
                                                        "gpt-6.1-sol", "response")])
         thread = metrics.Thread("one", turns={turn.id: turn},
@@ -787,11 +784,10 @@ class ReportTests(unittest.TestCase):
         report = metrics.build_breakdown([thread], boundary + timedelta(hours=2), report_zone=timezone.utc)
         periods = report["trend_periods"]["hourly"]
         points = dict(zip((p["label"] for p in periods), report["trends"]["hourly"]))
-        self.assertEqual(points["2026-10-03T09:00+00:00"]["ttft"]["count"], 0)
+        self.assertEqual(points["2026-10-03T09:00+00:00"]["throughput"]["count"], 0)
         self.assertEqual(points["2026-10-03T09:00+00:00"]["total_tokens"], 340)
         completed = points["2026-10-03T10:00+00:00"]
         self.assertEqual(completed["total_tokens"], 0)
-        self.assertEqual(completed["ttft"]["avg"], 2)
         self.assertEqual(completed["throughput"]["avg"], 2)
         self.assertEqual(completed["length"]["avg"], 120)
         self.assertEqual(completed["tools"]["avg"], 1)
@@ -823,7 +819,7 @@ class ReportTests(unittest.TestCase):
         daily = dict(zip((p["label"] for p in report["trend_periods"]["daily"]), report["trends"]["daily"]))
         self.assertIsNone(daily["2026-10-01"])
         self.assertEqual(daily["2026-10-03"]["total_tokens"], 140)
-        self.assertEqual(daily["2026-10-03"]["ttft"]["count"], 0)
+        self.assertEqual(daily["2026-10-03"]["throughput"]["count"], 0)
 
     def test_trend_costs_match_window_costs_and_flag_unpriced_periods(self):
         cutoff = datetime(2026, 10, 3, 12, tzinfo=timezone.utc)
@@ -871,18 +867,18 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual([w.label for w in periods if "T01:00" in w.label],
                                  ["2026-11-01T01:00-04:00", "2026-11-01T01:00-05:00"])
         turns = {}
-        for hour, ttft in ((5, 1), (6, 3)):
+        for hour, duration in ((5, 10), (6, 30)):
             at = datetime(2026, 11, 1, hour, 10, tzinfo=timezone.utc)
-            turns[str(hour)] = metrics.Turn(str(hour), start=at, end=at + timedelta(seconds=10),
-                                            completed=True, duration=10, ttft=ttft,
+            turns[str(hour)] = metrics.Turn(str(hour), start=at, end=at + timedelta(seconds=duration),
+                                            completed=True, duration=duration,
                                             modern=[metrics.UsageEvent(at, metrics.Usage(hour * 100, 40),
                                                                        "gpt-6.1-sol", str(hour))])
         report = metrics.build_breakdown([metrics.Thread("one", turns=turns)],
                                          datetime(2026, 11, 1, 8, tzinfo=timezone.utc), report_zone=toronto)
-        repeated = [(p["label"], point["ttft"]["avg"]) for p, point in
+        repeated = [(p["label"], point["length"]["avg"]) for p, point in
                     zip(report["trend_periods"]["hourly"], report["trends"]["hourly"])
                     if "T01:00" in p["label"]]
-        self.assertEqual(repeated, [("2026-11-01T01:00-04:00", 1), ("2026-11-01T01:00-05:00", 3)])
+        self.assertEqual(repeated, [("2026-11-01T01:00-04:00", 10), ("2026-11-01T01:00-05:00", 30)])
         token_totals = [point["total_tokens"] for period, point in
                         zip(report["trend_periods"]["hourly"], report["trends"]["hourly"])
                         if "T01:00" in period["label"]]
@@ -898,20 +894,20 @@ class ReportTests(unittest.TestCase):
         at = periods[index].start + timedelta(minutes=10)
         thread = metrics.Thread("one", turns={"t": metrics.Turn(
             "t", start=at, end=at + timedelta(seconds=10), completed=True,
-            duration=10, ttft=1, model="gpt-6.1-sol")},
+            duration=10, model="gpt-6.1-sol")},
             billing=[metrics.BillingEvent(at, "USD", Decimal(1))])
         metrics.add_thread(first.windows, thread, first.by_model, first.by_mode, first.by_tier)
         self.assertIsNot(first.windows[index], second.windows[index])
-        self.assertEqual(first.windows[index].ttft, [1])
-        self.assertEqual(second.windows[index].ttft, [])
+        self.assertEqual(first.windows[index].durations, {"one": 10})
+        self.assertEqual(second.windows[index].durations, {})
         self.assertEqual(second.windows[index].billing, {})
-        self.assertEqual(first.by_mode[metrics.SpeedMode.FAST].windows[index].ttft, [])
+        self.assertEqual(first.by_mode[metrics.SpeedMode.FAST].windows[index].durations, {})
         metrics.merge_breakdown(overall, first)
         metrics.merge_breakdown(overall, second)
-        self.assertEqual(overall.windows[index].ttft, [1])
-        self.assertEqual(overall.by_model["gpt-6.1-sol"][index].ttft, [1])
+        self.assertEqual(overall.windows[index].durations, {"one": 10})
+        self.assertEqual(overall.by_model["gpt-6.1-sol"][index].durations, {"one": 10})
         self.assertEqual(overall.windows[index].billing["USD"], Decimal(1))
-        self.assertEqual(second.windows[index].ttft, [])
+        self.assertEqual(second.windows[index].durations, {})
 
     def test_trend_history_starts_at_first_datapoint_beyond_one_year(self):
         oldest = datetime(2023, 4, 12, 14, tzinfo=timezone.utc)
@@ -923,8 +919,8 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(periods[0]["start"][:10], "2023-04-12")
             self.assertEqual(periods[-1]["end"], report["generated"])
             first_point = next(point for point in report["trends"][granularity]
-                               if point and point["ttft"]["count"])
-            self.assertEqual(first_point["ttft"]["count"], 1)
+                               if point and point["throughput"]["count"])
+            self.assertEqual(first_point["throughput"]["count"], 1)
         self.assertEqual(report["windows"][0]["total_tokens"], 1100)
         self.assertEqual(report["windows"][-1]["total_tokens"], 1100)
         html = metrics.render_report(report)
@@ -975,11 +971,11 @@ class ReportTests(unittest.TestCase):
             record("response_item", {"type": "function_call", "call_id": "b1"}, t2_start),
             record("response_item", {"type": "custom_tool_call", "call_id": "b2"}, t2_start),
             event("task_complete", t2_start + timedelta(seconds=30), turn_id="t2",
-                  duration_ms=30000, time_to_first_token_ms=2000)])
+                  duration_ms=30000)])
         self.write(prefix(thread="second", turn="t3") + [
             modern("t3", "r4", usage(3000, 300, 1200, 60)),
             event("task_complete", START + timedelta(seconds=30), turn_id="t3",
-                  duration_ms=30000, time_to_first_token_ms=1000)], "second.jsonl")
+                  duration_ms=30000)], "second.jsonl")
         r = self.report()
         a = r["by_model"]["gpt-6.1-sol"][0]
         b = r["by_model"]["gpt-5.5"][0]
@@ -987,9 +983,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(a["conversations"], 2)
         self.assertEqual(b["conversations"], 1)
         self.assertEqual(total["conversations"], 2)
-        self.assertEqual(a["metrics"]["ttft"], {"count": 2, "avg": .75, "min": .5, "median": .75, "max": 1, "p75": 1, "p95": 1, "p99": 1})
-        self.assertEqual(b["metrics"]["ttft"]["avg"], 2)
-        self.assertEqual(a["metrics"]["throughput"]["avg"], 15)
+        self.assertEqual(a["metrics"]["throughput"], {"count": 2, "avg": 15, "min": 10, "median": 15, "max": 20, "p75": 20, "p95": 20, "p99": 20})
         self.assertEqual(b["metrics"]["throughput"]["avg"], 20)
         self.assertEqual(a["metrics"]["length"]["avg"], 20)
         self.assertEqual(b["metrics"]["length"]["avg"], 30)
@@ -1002,8 +996,7 @@ class ReportTests(unittest.TestCase):
             for key in ["total_tokens", "tool_calls", "active_seconds"]:
                 self.assertEqual(sum(w[key] for w in models), total[key])
             self.assertEqual(sum(Decimal(w["cost"]) for w in models), Decimal(total["cost"]))
-            for metric in ["ttft", "throughput"]:
-                self.assertEqual(sum(w["metrics"][metric]["count"] for w in models), total["metrics"][metric]["count"])
+            self.assertEqual(sum(w["metrics"]["throughput"]["count"] for w in models), total["metrics"]["throughput"]["count"])
 
     def test_by_model_handles_legacy_unknown_missing_and_empty_windows(self):
         old = NOW - timedelta(days=60)
@@ -1013,14 +1006,14 @@ class ReportTests(unittest.TestCase):
         r = self.report()
         unknown = r["by_model"]["Unknown model"]
         self.assertEqual(unknown[0]["conversations"], 0)
-        self.assertIsNone(unknown[0]["metrics"]["ttft"]["avg"])
+        self.assertIsNone(unknown[0]["metrics"]["throughput"]["avg"])
         last_90 = next(w for w in unknown if w["label"] == "Last 90 days")
         self.assertEqual(last_90["total_tokens"], 1100)
         self.assertTrue(last_90["partial_cost"])
         self.assertEqual(last_90["metrics"]["throughput"]["avg"], 10)
         no_usage = r["by_model"]["gpt-5.5"][0]
         self.assertEqual(no_usage["total_tokens"], 0)
-        self.assertEqual(no_usage["metrics"]["ttft"]["avg"], .5)
+        self.assertEqual(no_usage["metrics"]["length"]["avg"], 10)
         self.assertIsNone(no_usage["metrics"]["throughput"]["avg"])
 
     def test_by_model_separates_normal_and_fast_usage_with_original_rates(self):
@@ -1047,7 +1040,7 @@ class ReportTests(unittest.TestCase):
                         self.assertEqual(window["total_tokens"], 1100)
                         self.assertEqual(window["tool_calls"], 1)
                         self.assertEqual(window["active_seconds"], 10)
-                        self.assertEqual(window["metrics"]["ttft"]["count"], 1)
+                        self.assertEqual(window["metrics"]["throughput"]["count"], 1)
                         self.assertEqual(window["metrics"]["throughput"]["avg"], 10)
                         self.assertFalse(window["partial_cost"])
                     self.assertEqual(Decimal(fast["cost"]), Decimal(normal["cost"]) * Decimal("1.5"))
@@ -1149,8 +1142,8 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(yesterday["tool_calls"], 1)
             self.assertEqual(today["active_seconds"], 10)
             self.assertEqual(yesterday["active_seconds"], 0)
-            self.assertEqual(today["metrics"]["ttft"]["count"], 1)
-            self.assertEqual(yesterday["metrics"]["ttft"]["count"], 0)
+            self.assertEqual(today["metrics"]["throughput"]["count"], 1)
+            self.assertEqual(yesterday["metrics"]["throughput"]["count"], 0)
             self.assertTrue(yesterday["end_exclusive"])
 
     def test_recorded_mode_mapping_and_partial_settings(self):
@@ -1184,9 +1177,8 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(w["conversations"], 1)
             self.assertEqual(w["total_tokens"], 1100)
             self.assertEqual(w["tool_calls"], 1)
-            self.assertEqual(w["metrics"]["ttft"], {"count": 1, "avg": .5, "min": .5, "median": .5, "max": .5, "p75": .5, "p95": .5, "p99": .5})
             self.assertEqual(w["metrics"]["length"]["avg"], 10)
-            self.assertEqual(w["metrics"]["throughput"]["avg"], 10)
+            self.assertEqual(w["metrics"]["throughput"], {"count": 1, "avg": 10, "min": 10, "median": 10, "max": 10, "p75": 10, "p95": 10, "p99": 10})
         self.assertEqual(Decimal(normal["cost"]), Decimal(".00224"))
         self.assertEqual(Decimal(fast["cost"]), Decimal(".0093"))
         self.assertEqual(r["by_mode"]["Normal"]["by_model"]["gpt-5.5-fast"][0]["total_tokens"], 0)
@@ -1196,8 +1188,7 @@ class ReportTests(unittest.TestCase):
             for key in ["total_tokens", "tool_calls", "active_seconds"]:
                 self.assertEqual(sum(w[key] for w in modes), total[key])
             self.assertEqual(sum(Decimal(w["cost"]) for w in modes), Decimal(total["cost"]))
-            for metric in ["ttft", "throughput"]:
-                self.assertEqual(sum(w["metrics"][metric]["count"] for w in modes), total["metrics"][metric]["count"])
+            self.assertEqual(sum(w["metrics"]["throughput"]["count"] for w in modes), total["metrics"]["throughput"]["count"])
             for group in r["by_mode"].values():
                 self.assertEqual(sum(ws[i]["total_tokens"] for ws in group["by_model"].values()), group["windows"][i]["total_tokens"])
 
@@ -1211,11 +1202,11 @@ class ReportTests(unittest.TestCase):
             w = r["by_mode"][mode]["windows"][0]
             self.assertEqual(w["total_tokens"], 1100)
             self.assertEqual(w["active_seconds"], 0)
-            self.assertIsNone(w["metrics"]["ttft"]["avg"])
+            self.assertIsNone(w["metrics"]["throughput"]["avg"])
         for model in ("gpt-6.1-sol", "gpt-6.1-sol-fast"):
             self.assertEqual(r["by_model"][model][0]["total_tokens"], 1100)
             self.assertEqual(r["by_model"][model][0]["active_seconds"], 0)
-            self.assertIsNone(r["by_model"][model][0]["metrics"]["ttft"]["avg"])
+            self.assertIsNone(r["by_model"][model][0]["metrics"]["throughput"]["avg"])
         self.assertEqual(r["by_model"]["Mixed modes (timing)"][0]["active_seconds"], 10)
         mixed = r["by_mode"]["Mixed modes (timing)"]["windows"][0]
         self.assertEqual(mixed["total_tokens"], 0)
@@ -1233,7 +1224,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(normal["total_tokens"], 3300)
         self.assertEqual(normal["conversations"], 1)
         self.assertEqual(normal["metrics"]["length"], {"count": 1, "avg": 20, "min": 20, "median": 20, "max": 20, "p75": 20, "p95": 20, "p99": 20})
-        self.assertEqual(normal["metrics"]["ttft"]["count"], 2)
+        self.assertEqual(normal["metrics"]["throughput"]["count"], 2)
         self.assertEqual(normal["metrics"]["throughput"]["avg"], 15)
         self.assertEqual(normal["cost"], r["windows"][0]["cost"])
         self.assertNotIn("Unknown", r["by_mode"])
@@ -1352,11 +1343,11 @@ class ReportTests(unittest.TestCase):
             record("response_item", {"type": "function_call", "call_id": "b"}, second_start),
             record("response_item", {"type": "custom_tool_call", "call_id": "c"}, second_start),
             event("task_complete", second_start + timedelta(seconds=30), turn_id="t2",
-                  duration_ms=30000, time_to_first_token_ms=2000)])
+                  duration_ms=30000)])
         self.write(prefix(thread="second", turn="t3", model="gpt-6-luna") + [
             modern("t3", "r3", usage(3000, 300, 1200, 60)),
             event("task_complete", START + timedelta(seconds=20), turn_id="t3",
-                  duration_ms=20000, time_to_first_token_ms=1000)], "second.jsonl")
+                  duration_ms=20000)], "second.jsonl")
         r = self.report()
         tier = r["by_tier"]["Budget"]
         w = tier["windows"][0]
@@ -1364,8 +1355,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(w["total_tokens"], 6600)
         self.assertEqual(w["metrics"]["length"], {"count": 2, "avg": 30, "min": 20, "median": 30, "max": 40, "p75": 40, "p95": 40, "p99": 40})
         self.assertEqual(w["metrics"]["tools"], {"count": 2, "avg": 1.5, "min": 0, "median": 1.5, "max": 3, "p75": 3, "p95": 3, "p99": 3})
-        self.assertAlmostEqual(w["metrics"]["ttft"]["avg"], 7 / 6)
-        self.assertEqual(w["metrics"]["ttft"]["p95"], 2)
+        self.assertEqual(w["metrics"]["throughput"]["count"], 3)
         self.assertEqual(w["metrics"]["throughput"]["p99"], 15)
         self.assertEqual(tier["by_mode"]["Fast"]["windows"][0]["active_seconds"], 30)
         self.assertEqual(tier["by_mode"]["Fast"]["by_model"]["gpt-5.6-terra-fast"][0]["total_tokens"], 2200)
@@ -1376,8 +1366,7 @@ class ReportTests(unittest.TestCase):
             for key in ["total_tokens", "tool_calls", "active_seconds"]:
                 self.assertEqual(sum(w[key] for w in tiers), total[key])
             self.assertEqual(sum(Decimal(w["cost"]) for w in tiers), Decimal(total["cost"]))
-            for metric in ["ttft", "throughput"]:
-                self.assertEqual(sum(w["metrics"][metric]["count"] for w in tiers), total["metrics"][metric]["count"])
+            self.assertEqual(sum(w["metrics"]["throughput"]["count"] for w in tiers), total["metrics"]["throughput"]["count"])
             for group in r["by_tier"].values():
                 self.assertEqual(sum(ws[i]["total_tokens"] for ws in group["by_model"].values()), group["windows"][i]["total_tokens"])
                 self.assertEqual(sum(Decimal(m["windows"][i]["cost"]) for m in group["by_mode"].values()), Decimal(group["windows"][i]["cost"]))
@@ -1388,7 +1377,7 @@ class ReportTests(unittest.TestCase):
             modern(response="r2"), complete()])
         r = self.report()
         w = r["by_tier"]["Budget"]["windows"][0]
-        self.assertEqual(w["metrics"]["ttft"]["count"], 1)
+        self.assertEqual(w["metrics"]["throughput"]["count"], 1)
         self.assertEqual(w["active_seconds"], 10)
         self.assertEqual(w["metrics"]["throughput"]["avg"], 20)
         self.assertEqual(r["by_tier"]["Budget"]["by_model"]["Mixed models (timing)"][0]["active_seconds"], 10)
@@ -1406,7 +1395,7 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(w["total_tokens"], 1100)
             self.assertEqual(w["tool_calls"], 1)
             self.assertEqual(w["active_seconds"], 0)
-            self.assertIsNone(w["metrics"]["ttft"]["avg"])
+            self.assertIsNone(w["metrics"]["throughput"]["avg"])
         mixed = r["by_tier"]["Mixed tiers (timing)"]
         self.assertEqual(mixed["windows"][0]["active_seconds"], 10)
         self.assertEqual(mixed["windows"][0]["total_tokens"], 0)
@@ -1447,7 +1436,7 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(by_label["Last 30 days"]["total_tokens"], 1100)
             self.assertEqual(by_label["Last 60 days"]["total_tokens"], 3300)
             self.assertEqual(by_label["Last 90 days"]["total_tokens"], 4400)
-            self.assertEqual(by_label["Last 60 days"]["metrics"]["ttft"]["count"], 1)
+            self.assertEqual(by_label["Last 60 days"]["metrics"]["throughput"]["count"], 1)
             self.assertEqual(by_label["Last 60 days"]["active_seconds"], 10)
 
 
@@ -1635,14 +1624,14 @@ class CacheTests(unittest.TestCase):
     def test_aggregation_boundary_checks_do_not_scale_with_history_bucket_count(self):
         at = NOW - timedelta(seconds=20)
         turn = metrics.Turn("t", start=at, end=NOW, model="gpt-6.1-sol", completed=True,
-                            duration=20, ttft=.5,
+                            duration=20,
                             modern=[metrics.UsageEvent(at, metrics.Usage(1000, 100), "gpt-6.1-sol", "r")])
         thread = metrics.Thread("one", turns={turn.id: turn},
                                 calls={"call": metrics.ToolCall(at, turn.id, turn.model)})
         old_at = NOW - timedelta(days=1000)
         old = metrics.Thread("old", turns={"old": metrics.Turn(
             "old", start=old_at, end=old_at + timedelta(seconds=20), model=turn.model,
-            completed=True, duration=20, ttft=.5)})
+            completed=True, duration=20)})
         contains = metrics.Window.contains
         checks = []
         def counted(window, timestamp):
@@ -1751,7 +1740,7 @@ class HarnessTests(unittest.TestCase):
         window = report["windows"][0]
         self.assertEqual(window["total_tokens"], 1100)
         self.assertEqual(window["conversations"], 1)
-        self.assertEqual(window["metrics"]["ttft"]["avg"], .5)
+        self.assertEqual(window["metrics"]["throughput"]["avg"], 10)
         self.assertEqual(Decimal(window["cost"]), Decimal(".00224"))
 
     def test_t3_v2_native_references_do_not_use_internal_thread_ids(self):
@@ -2018,7 +2007,7 @@ class HarnessTests(unittest.TestCase):
     def test_copilot_per_response_usage_ignores_shutdown_double_count(self):
         usage_data = {"model": "claude-sonnet-4.6", "inputTokens": 700, "outputTokens": 100,
                       "cacheReadTokens": 400, "cacheWriteTokens": 200, "reasoningTokens": 20,
-                      "apiCallId": "response", "timeToFirstTokenMs": 500, "cost": 3,
+                      "apiCallId": "response", "cost": 3,
                       "copilotUsage": {"totalNanoAiu": 1000000}}
         rows = [self.copilot("session.start", "start", {"sessionId": "same-id"}),
                 self.copilot("assistant.turn_start", "turn", {"turnId": "t1"}),
@@ -2032,7 +2021,7 @@ class HarnessTests(unittest.TestCase):
         w = r["windows"][0]
         self.assertEqual(w["total_tokens"], 800)
         self.assertEqual(w["tool_calls"], 1)
-        self.assertEqual(w["metrics"]["ttft"]["avg"], .5)
+        self.assertEqual(w["metrics"]["throughput"]["count"], 1)
         self.assertEqual(Decimal(w["cost"]), Decimal(".00267"))
         self.assertEqual(w["recorded_billing"], {"Copilot nano-AIU": "1000000", "Copilot premium requests": "3"})
 

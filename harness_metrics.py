@@ -451,7 +451,6 @@ class Turn:
     start: datetime | None = None
     end: datetime | None = None
     duration: float | None = None
-    ttft: float | None = None
     model: str | None = None
     mode: SpeedMode = SpeedMode.NORMAL
     completed: bool = False
@@ -674,7 +673,6 @@ def read_thread(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
                         turn.completed = True
                         turn.aborted = False
                         turn.duration = milliseconds(payload.get("duration_ms"))
-                        turn.ttft = milliseconds(payload.get("time_to_first_token_ms"))
                         if turn.duration is None:
                             start = timestamp(payload.get("started_at")) or turn.start
                             if start and at >= start:
@@ -906,9 +904,6 @@ def read_copilot(thread_id: str, paths: list[Path], quality: Quality) -> Thread:
                     continue
                 seen_responses.add(response_id)
                 turn.modern.append(UsageEvent(at, usage, data.get("model") or model, response_id))
-                ttft = milliseconds(data.get("timeToFirstTokenMs"))
-                if turn.ttft is None:
-                    turn.ttft = ttft
                 # cost is a premium-request multiplier, never USD.
                 add_billing(thread, at, "Copilot premium requests", data.get("cost"))
                 native = data.get("copilotUsage")
@@ -1025,7 +1020,6 @@ class Window:
     conversations: set[str] = field(default_factory=set)
     durations: dict[str, float] = field(default_factory=dict)
     call_counts: Counter[str] = field(default_factory=Counter)
-    ttft: list[float] = field(default_factory=list)
     throughput: list[float] = field(default_factory=list)
     tokens: Counter[Category] = field(default_factory=Counter)
     costs: dict[Category, Decimal] = field(default_factory=lambda: defaultdict(Decimal))
@@ -1173,7 +1167,6 @@ def merge_breakdown(target: Breakdown, source: Breakdown) -> None:
             for conversation, duration in other.durations.items():
                 window.durations[conversation] = window.durations.get(conversation, 0) + duration
             window.call_counts.update(other.call_counts)
-            window.ttft.extend(other.ttft)
             window.throughput.extend(other.throughput)
             window.tokens.update(other.tokens)
             for category, cost in other.costs.items():
@@ -1311,10 +1304,6 @@ def add_thread(windows: list[Window], thread: Thread,
                 window.coverage["Aborted turns"] += int(turn.aborted)
                 continue
             window.coverage["Completed turns"] += 1
-            if turn.ttft is not None:
-                window.ttft.append(turn.ttft)
-            else:
-                window.coverage["Missing first-token timing"] += 1
             if turn.duration is not None:
                 window.durations[thread.id] = window.durations.get(thread.id, 0) + turn.duration
             else:
@@ -1356,7 +1345,7 @@ def distribution(values: Iterable[float]) -> dict[str, int | float | None]:
 
 
 def metric_summary(window: Window) -> dict[str, dict[str, int | float | None]]:
-    return {"ttft": distribution(window.ttft), "throughput": distribution(window.throughput),
+    return {"throughput": distribution(window.throughput),
             "length": distribution(window.durations.values()),
             "tools": distribution(window.call_counts[c] for c in window.conversations)}
 
@@ -1489,7 +1478,7 @@ def session_identity(path: Path, harness: Harness) -> str:
 CHECKPOINT_GROUPS = 250
 
 # Bump when the schema or parser semantics change; cached facts must match the readers.
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 
 # Children precede parents so older caches can be dropped with foreign keys enabled.
 CACHE_TABLES = ("cache_billing", "cache_calls", "cache_usage", "cache_turns", "cache_threads",
@@ -1573,12 +1562,12 @@ class MetricsReader:
         threads = {thread_id: Thread(thread_id, harness=Harness(harness)) for thread_id, harness in
                    self.connection.execute("SELECT thread_id, harness FROM cache_threads WHERE cache_key=? ORDER BY rowid", (key,))}
         for row in self.connection.execute(
-                "SELECT thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted, output_tokens "
+                "SELECT thread_id, turn_id, start, end, duration, model, mode, completed, aborted, output_tokens "
                 "FROM cache_turns WHERE cache_key=? ORDER BY rowid", (key,)):
-            thread_id, turn_id, start, end, duration, ttft, model, mode, completed, aborted, output_tokens = row
+            thread_id, turn_id, start, end, duration, model, mode, completed, aborted, output_tokens = row
             threads[thread_id].turns[turn_id] = Turn(
                 turn_id, start=datetime.fromisoformat(start) if start else None,
-                end=datetime.fromisoformat(end) if end else None, duration=duration, ttft=ttft,
+                end=datetime.fromisoformat(end) if end else None, duration=duration,
                 model=model, mode=SpeedMode(mode), completed=bool(completed), aborted=bool(aborted),
                 output_tokens=output_tokens)
         for row in self.connection.execute(
@@ -1617,7 +1606,7 @@ class MetricsCache(MetricsReader):
                 FOREIGN KEY (cache_key) REFERENCES cache_groups ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS cache_turns (
                 cache_key TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT NOT NULL,
-                start TEXT, end TEXT, duration REAL, ttft REAL, model TEXT, mode TEXT NOT NULL,
+                start TEXT, end TEXT, duration REAL, model TEXT, mode TEXT NOT NULL,
                 completed INTEGER NOT NULL, aborted INTEGER NOT NULL, output_tokens INTEGER,
                 PRIMARY KEY (cache_key, thread_id, turn_id),
                 FOREIGN KEY (cache_key, thread_id) REFERENCES cache_threads ON DELETE CASCADE);
@@ -1684,9 +1673,9 @@ class MetricsCache(MetricsReader):
         for thread in threads:
             self.connection.execute("INSERT INTO cache_threads VALUES (?, ?, ?)",
                                     (key, thread.id, thread.harness.value))
-            self.connection.executemany("INSERT INTO cache_turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+            self.connection.executemany("INSERT INTO cache_turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
                 (key, thread.id, turn.id, turn.start.isoformat() if turn.start else None,
-                 turn.end.isoformat() if turn.end else None, turn.duration, turn.ttft, turn.model,
+                 turn.end.isoformat() if turn.end else None, turn.duration, turn.model,
                  turn.mode.value, turn.completed, turn.aborted, turn.output_tokens) for turn in thread.turns.values()])
             self.connection.executemany("INSERT INTO cache_usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
                 (key, thread.id, turn.id, i, record.at.isoformat(), record.model, record.key,
@@ -2266,7 +2255,6 @@ noscript{display:block;padding:20px;background:var(--warn-bg)}
 <details class="more"><summary>Matched OpenRouter prices</summary><p class="samples">Base catalog rates in USD per million tokens; context overrides are applied per request in estimated costs.</p><div class="table-wrap"><table id="router-prices"></table></div></details>
 <details class="more"><summary>Parser diagnostics</summary><div class="table-wrap"><table id="diagnostics"></table></div><ul class="warnings" id="warnings"></ul></details></article></div>
 <article class="card" style="margin-top:16px"><div class="card-head"><div><h3>Definitions</h3><p>Expand a topic to see exactly how it is measured.</p></div><button type="button" class="ghost" id="expand-defs">Expand all</button></div><div class="defs" id="definitions">
-<details><summary>First-token time</summary><p>Explicit logged time to first token, per completed turn. Missing timings are excluded.</p></details>
 <details><summary>Effective throughput</summary><p>All output tokens, including reasoning, divided by full turn duration. Tool execution and waiting are included.</p></details>
 <details><summary>Conversation length</summary><p>Sum of completed turn durations per thread in the selected window. Idle time between turns is excluded; subagents count separately.</p></details>
 <details><summary>Tool calls</summary><p>Model-issued function, custom-tool, web-search, and tool-search calls. Outputs and mirrored completion events are excluded; nested commands inside a call are not counted separately.</p></details>
@@ -2295,7 +2283,6 @@ const source=window.reportSource||embeddedSource();
 let data,firstDate,cutoffDate,modelOrder=[];
 const SLOTS=7;
 const metricDefs=[
-    {key:'ttft',title:'Time to first token',short:'First token',unit:'s',desc:'Explicit first-token timing per completed turn',sample:'turn',chart:v=>v,axis:v=>`${trim(v)}s`,format:v=>seconds(v)},
     {key:'throughput',title:'Effective throughput',short:'Throughput',unit:'tok/s',desc:'Output tokens over full turn duration',sample:'turn',chart:v=>v,axis:v=>compact(v),format:v=>`${v>=1000?compact(v):number(v,v>=100?0:1)} tok/s`},
     {key:'length',title:'Conversation length',short:'Length',unit:'min',desc:'Active duration per conversation, idle time excluded',sample:'conversation',chart:v=>v/60,axis:v=>`${trim(v)}m`,format:v=>duration(v)},
     {key:'tools',title:'Tool calls per conversation',short:'Calls / conv.',unit:'calls',desc:'Model-issued calls per conversation',sample:'conversation',chart:v=>v,axis:v=>trim(v),format:v=>number(v,1)}];
@@ -2313,7 +2300,6 @@ const money=n=>{n=Number(n);return n>0&&n<.005?'<$0.01':n.toLocaleString('en-US'
 const moneyAxis=n=>n>=1000?'$'+compact(n):n>=10?'$'+number(n,0):n>=1||n<=0?'$'+number(n,2):'$'+n.toLocaleString('en-US',{maximumSignificantDigits:2});
 const moneyRate=n=>n.toLocaleString('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:n<1?3:2});
 const percent=(v,total)=>total>0?(v/total*100<1&&v>0?'<1%':`${Math.round(v/total*100)}%`):'—';
-const seconds=v=>v===null||v===undefined?'—':v<10?`${number(v,2)} s`:`${number(v,1)} s`;
 function duration(s){if(s===null||s===undefined)return '—';s=Math.round(s);if(s<60)return `${s}s`;const m=Math.floor(s/60);if(m<60)return `${m}m ${String(s%60).padStart(2,'0')}s`;const h=Math.floor(m/60);return `${number(h,0)}h ${String(m%60).padStart(2,'0')}m`}
 const day=(iso,opts)=>new Date(iso.slice(0,10)+'T00:00:00Z').toLocaleDateString('en-US',{...opts,timeZone:'UTC'});
 const fmtDate=value=>new Date(value).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:data.timezone});
@@ -2633,12 +2619,12 @@ function comparison(){
 function quality(w){
     const c=w.coverage,completed=c['Completed turns']||0;
     $('coverage-meters').replaceChildren();
-    for(const [label,have] of [['First-token timing',w.metrics.ttft.count],['Turn duration',completed-(c['Missing turn duration']||0)],['Throughput',w.metrics.throughput.count]]){
+    for(const [label,have] of [['Turn duration',completed-(c['Missing turn duration']||0)],['Throughput',w.metrics.throughput.count]]){
         const row=text('div','','meter-row'),meter=text('div','','meter'),fill=text('i');fill.style.width=completed?`${Math.min(100,have/completed*100)}%`:'0';meter.append(fill);
         meter.setAttribute('role','meter');meter.setAttribute('aria-label',label);meter.setAttribute('aria-valuemin','0');meter.setAttribute('aria-valuemax',String(completed));meter.setAttribute('aria-valuenow',String(have));
         row.append(text('span',label),text('span',completed?`${integer(have)} of ${integer(completed)} · ${percent(have,completed)}`:'No completed turns','val'),meter);$('coverage-meters').append(row)}
     $('coverage-counts').replaceChildren(...[['Completed turns',completed],['Aborted turns',c['Aborted turns']||0],['Unfinished turns',c['Unfinished turns']||0],['Usage responses',c['Usage responses']||0]].map(([k,v])=>{const d=text('div');d.append(text('dt',k),text('dd',integer(v)));return d}));
-    const coverage=[['Completed turns',completed],['First-token timing samples',w.metrics.ttft.count],['Missing first-token timing',c['Missing first-token timing']||0],['Missing turn duration',c['Missing turn duration']||0],['Throughput samples',w.metrics.throughput.count],['Missing throughput samples',c['Missing throughput samples']||0],['Conversation duration samples',w.metrics.length.count],['Aborted turns',c['Aborted turns']||0],['Unfinished turns started in window',c['Unfinished turns']||0],['Usage responses',c['Usage responses']||0],['Aggregate snapshots',c['Aggregate snapshots']||0],['Tool calls',w.tool_calls]];
+    const coverage=[['Completed turns',completed],['Missing turn duration',c['Missing turn duration']||0],['Throughput samples',w.metrics.throughput.count],['Missing throughput samples',c['Missing throughput samples']||0],['Conversation duration samples',w.metrics.length.count],['Aborted turns',c['Aborted turns']||0],['Unfinished turns started in window',c['Unfinished turns']||0],['Usage responses',c['Usage responses']||0],['Aggregate snapshots',c['Aggregate snapshots']||0],['Tool calls',w.tool_calls]];
     table($('coverage'),['Measurement','Count'],coverage.map(([k,v])=>[k,integer(v)]));
     $('unpriced').replaceChildren();
     if(w.partial_cost){$('unpriced').append(text('p',`⚠ ${integer(w.unpriced_tokens)} tokens have no rate and are excluded from estimated cost:`,'samples'));const t=document.createElement('table');table(t,['Model','Unpriced tokens'],Object.entries(w.unpriced).map(([k,v])=>[k,integer(v)]));$('unpriced').append(t)}
