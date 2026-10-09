@@ -924,8 +924,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report["windows"][0]["total_tokens"], 1100)
         self.assertEqual(report["windows"][-1]["total_tokens"], 1100)
         html = metrics.render_report(report)
-        self.assertIn('id="trend-start"', html)
-        self.assertIn('id="trend-end"', html)
+        self.assertNotIn('id="trend-start"', html)
+        self.assertNotIn('id="trend-end"', html)
         self.assertNotIn("Past 365 days", html)
 
     def test_trend_start_uses_local_date_and_ignores_future_and_billing_only_activity(self):

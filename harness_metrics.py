@@ -2203,7 +2203,6 @@ th button{border:0;background:none;padding:0;color:inherit;font:inherit;display:
 details.more{margin-top:12px;border-top:1px solid var(--grid);padding-top:10px}details.more>summary{cursor:pointer;font-weight:600;font-size:13px}
 .sources{font-size:12px;color:var(--muted);margin-top:16px;overflow-wrap:anywhere;line-height:1.6}.warnings{font:11px/1.7 ui-monospace,monospace;overflow-wrap:anywhere;padding-left:18px;color:var(--ink-2)}
 .footer{display:flex;justify-content:space-between;gap:16px;margin-top:32px;color:var(--muted);font-size:12px;flex-wrap:wrap}
-.range-error{color:#c03030;font-size:12.5px;margin-top:8px}
 .tooltip{position:fixed;z-index:20;background:var(--tip-bg);color:var(--tip-ink);padding:8px 10px;border-radius:8px;font-size:12px;pointer-events:none;min-width:150px;max-width:300px;box-shadow:0 8px 28px rgba(0,0,0,.22)}.tooltip .tip-title{font-weight:600;margin-bottom:4px;color:var(--tip-muted)}.tooltip .tip-row{display:grid;grid-template-columns:14px auto 1fr;gap:8px;align-items:center;line-height:1.7}.tooltip .tip-row strong{font-variant-numeric:tabular-nums;font-weight:650}.tooltip .tip-row span:last-child{color:var(--tip-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tooltip .tip-row .key.line{width:12px}.tooltip .tip-foot{color:var(--tip-muted);margin-top:4px;border-top:1px solid rgba(128,128,128,.3);padding-top:4px}
 noscript{display:block;padding:20px;background:var(--warn-bg)}
 @media(max-width:1100px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
@@ -2226,8 +2225,7 @@ noscript{display:block;padding:20px;background:var(--warn-bg)}
 
 <section class="section" id="trends-section" aria-labelledby="trends-title">
 <div class="section-head"><div><h2 id="trends-title">Usage over time</h2><p id="trend-caption"></p></div>
-<div class="filters"><label class="field" for="trend-start">From <input id="trend-start" type="date" required aria-describedby="trend-range-error"></label><label class="field" for="trend-end">To <input id="trend-end" type="date" required aria-describedby="trend-range-error"></label><label class="field" for="granularity-select">Interval <select id="granularity-select"><option value="hourly">Hourly</option><option value="daily" selected>Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label></div></div>
-<p id="trend-range-error" class="range-error" role="status" hidden></p>
+<div class="filters"><label class="field" for="granularity-select">Interval <select id="granularity-select"><option value="hourly">Hourly</option><option value="daily" selected>Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label></div></div>
 <div class="stack">
 <article class="card" id="usage-card"><div class="card-head"><div><h3 id="usage-title">Tokens per day</h3><p id="usage-desc"></p></div><div class="filters"><div class="segmented" id="usage-metric" aria-label="Measure"></div><label class="field" for="split-select">Split by <select id="split-select"><option value="none">Nothing</option><option value="model">Model</option><option value="harness">Harness</option><option value="tier">Tier</option><option value="mode">Mode</option></select></label></div></div>
 <div class="legend" id="usage-legend"></div><div class="chart" id="usage-chart"></div><div id="usage-table"></div></article>
@@ -2260,7 +2258,7 @@ noscript{display:block;padding:20px;background:var(--warn-bg)}
 <details><summary>Tool calls</summary><p>Model-issued function, custom-tool, web-search, and tool-search calls. Outputs and mirrored completion events are excluded; nested commands inside a call are not counted separately.</p></details>
 <details><summary>Token totals</summary><p>Total tokens equals input plus output. Input includes cached input and cache writes; output includes reasoning. Cached input counts cache reads and is a subset of input, not an additional token total. The composition chart separates these categories so each token is counted once.</p></details>
 <details><summary>Distribution statistics</summary><p>Average is the arithmetic mean. Median is the middle sample, or the average of the two middle samples for an even count. Minimum and maximum are observed extremes. P75, P95, and P99 use nearest rank. All statistics use the same valid samples; each completed turn receives equal weight for timing and throughput.</p></details>
-<details><summary>Trend points</summary><p>From and To default to the first recorded activity date and the report cutoff date. Hourly, daily, weekly (Monday start), and monthly points use periods in the report timezone across all available history. Hourly points distinguish repeated daylight saving hours by their UTC offset. The date controls show periods overlapping the chosen range; weekly and monthly statistics include the whole calendar period. The first and current periods can be partial. Statistics are calculated from each period's samples; conversation duration and calls include activity within that period. Token and cost points show recorded usage per period; periods without recorded usage show zero. Performance statistics do not affect the usage chart. Missing performance samples appear as gaps. The activity heatmap sums hourly tokens by weekday and hour of the report timezone across the chosen range. Summary sparklines use hourly points for Today and Yesterday and daily points overlapping other windows. Figures below charts describe the selected reporting window.</p></details>
+<details><summary>Trend points</summary><p>Hourly, daily, weekly (Monday start), and monthly points use periods in the report timezone across all available history. Hourly points distinguish repeated daylight saving hours by their UTC offset. Usage, heatmap, and performance charts show periods overlapping the dates of the selected reporting window; weekly and monthly statistics include the whole calendar period. The first and current periods can be partial. Statistics are calculated from each period's samples; conversation duration and calls include activity within that period. Token and cost points show recorded usage per period; periods without recorded usage show zero. Performance statistics do not affect the usage chart. Missing performance samples appear as gaps. The activity heatmap sums hourly tokens by weekday and hour of the report timezone across the selected window. Summary sparklines use hourly points for Today and Yesterday and daily points overlapping other windows. Figures below charts describe the selected reporting window.</p></details>
 <details><summary>Window boundaries</summary><p>Tokens and calls use record time; turn metrics use completion time. Today starts at midnight in the report timezone and ends at the report cutoff. Yesterday is the preceding calendar day in that timezone, excluding today's midnight. Rolling windows are exact 24-hour days. The full duration of a turn finishing in the window is assigned to that window.</p></details>
 <details><summary>Model attribution</summary><p>Fast usage has a separate model entry with a “-fast” suffix. Requests crossing a published context-pricing threshold have a “-long” suffix, including cached input when selecting the threshold; combined usage has “-fast-long”. Usage below the threshold keeps the model name unless Fast. Models without context pricing and aggregate records without per-request sizes do not receive “-long”. Tokens, calls, timing, and costs are separated by recorded mode, with the Fast premium applied to the underlying model's rates. Tokens and calls use their recorded model, falling back to the turn model. Timing uses the model generating that turn. Conversation duration and tool counts include only that model's activity; a thread using multiple models or modes appears in each, so conversation counts are not additive. If several models generate output within one turn, its timing is listed under “Mixed models (timing)”. If one model uses several modes within a turn, its timing is listed under “Mixed modes (timing)” because separate durations cannot be recovered. If one model in one mode crosses context thresholds within a turn, its timing is listed under “Mixed contexts (timing)”. Tool calls follow the context class of matching model and mode usage in their turn; ambiguous calls are listed under “Mixed contexts (tools)”. Mode and tier totals retain this activity once. When the usage chart is split by model, models beyond the seven with the most tokens across the report share the “Other” color, and are combined when several appear together.</p></details>
 <details><summary>Model tiers</summary><p>Budget: Luna, Terra, GPT mini and nano models, Spark, codex-auto-review, and Claude Haiku. Medium: Sol, GPT-5.4, GPT-5.5, and Claude Sonnet. High: Astra, Claude Opus, Fable, and Mythos. Models outside these groups are Unclassified. Tier metrics are calculated from underlying activity, with each conversation counted once per tier. Turns using several models in the same tier retain their timing in that tier; turns spanning tiers have timing under “Mixed tiers (timing)”. Per-model pricing and the Fast premium still apply. The model selector and comparison table show entries with recorded tokens in the selected window, harness, tier, and mode. Zero-token entries, including shared timing and tool-call buckets, remain included in aggregate totals and coverage.</p></details>
@@ -2289,7 +2287,7 @@ const metricDefs=[
 const chartStats=[['avg','Average','var(--s1)'],['median','Median','var(--s2)'],['p75','P75','var(--s3)'],['p95','P95','var(--s7)'],['p99','P99','var(--s5)']];
 const statDefs=[['median','Median'],['avg','Average'],['p75','P75'],['p95','P95'],['p99','P99'],['min','Minimum'],['max','Maximum']];
 const distOrder=[['min','Min'],['median','Median'],['avg','Avg'],['p75','P75'],['p95','P95'],['p99','P99'],['max','Max']];
-const state={window:0,harness:'',tier:'',model:'',mode:'',granularity:'daily',start:'',end:'',measure:'tokens',split:'none',stats:new Set(['median','p95']),compare:'model',statistic:'median',sort:'cost',dir:-1,usageTable:false,heatTable:false};
+const state={window:0,harness:'',tier:'',model:'',mode:'',granularity:'daily',measure:'tokens',split:'none',stats:new Set(['median','p95']),compare:'model',statistic:'median',sort:'cost',dir:-1,usageTable:false,heatTable:false};
 
 // Formatting
 const number=(n,d=2)=>Number(n).toLocaleString('en-US',{maximumFractionDigits:d});
@@ -2415,6 +2413,8 @@ const activeModels=()=>state.mode?tierGroup().by_mode[state.mode].by_model:tierG
 const activeWindows=()=>scopeWindows(filters());
 const hasActivity=windows=>windows&&windows.some(w=>w.conversations>0||w.total_tokens>0);
 const longest=windows=>windows[windows.length-1];
+// Trend charts cover the local dates of the selected reporting window
+const windowRange=()=>{const w=data.windows[state.window],start=w.start.slice(0,10);return {start,end:w.end_exclusive?start:w.end.slice(0,10)}};
 
 function embeddedSource(){return {live:false,load:async()=>JSON.parse($('report-data').textContent),series:async(scope,granularity,start,end)=>{
     const daily=data.trend_periods.daily,firstDay=daily.find(p=>p.start.slice(0,10)===start)||daily[0],rangeStart=Date.parse(firstDay.start),trends=scopeTrends(scope,granularity);
@@ -2459,7 +2459,7 @@ function usageSeries(entities,results,periods,measure){
     return series;
 }
 async function usage(){
-    const g=state.granularity,measure=state.measure,isCost=measure==='cost',entities=splitEntities(state.split),start=state.start,end=state.end;
+    const g=state.granularity,measure=state.measure,isCost=measure==='cost',entities=splitEntities(state.split),{start,end}=windowRange();
     const per={hourly:'hour',daily:'day',weekly:'week',monthly:'month'}[g];
     $('usage-title').textContent=`${isCost?'Estimated cost':'Tokens'} per ${per}`;
     $('usage-desc').textContent=isCost?'API-equivalent USD estimate per period at current rates':'Input plus output tokens per period · includes cached input and reasoning';
@@ -2479,7 +2479,7 @@ function toggleButton(flag,rerender){const b=text('button',state[flag]?'Hide dat
 // Weekday × hour heatmap of hourly tokens in the chosen range
 const weekdays=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 async function heatmap(){
-    const result=await load('heatmap',[$('heat-chart')],()=>series(filters(),'hourly',state.start,state.end));
+    const result=await load('heatmap',[$('heat-chart')],()=>{const {start,end}=windowRange();return series(filters(),'hourly',start,end)});
     if(!result)return;
     const grid=weekdays.map(()=>new Array(24).fill(0));
     for(const [index,period] of result.periods.entries()){const v=result.points[index]?.total_tokens||0;if(!v)continue;const d=(new Date(period.label.slice(0,10)+'T00:00:00Z').getUTCDay()+6)%7;grid[d][Number(period.label.slice(11,13))]+=v}
@@ -2517,7 +2517,7 @@ async function performance(w){
         $('performance').append(card);charts.push([chart,def]);
     }
     if(!shown.length){for(const [chart] of charts)mount(chart,()=>text('div','Select a statistic above to draw the trend.','empty'));return}
-    const result=await load('performance',charts.map(([chart])=>chart),()=>series(filters(),granularity,state.start,state.end));
+    const result=await load('performance',charts.map(([chart])=>chart),()=>{const {start,end}=windowRange();return series(filters(),granularity,start,end)});
     if(!result)return;
     const {periods,points}=result;
     for(const [chart,def] of charts){
@@ -2663,15 +2663,13 @@ function chips(){
 }
 
 // State persists in the URL hash so a view can be reloaded or shared
-function saveState(){const p=new URLSearchParams();const put=(k,v,d)=>{if(v!==d)p.set(k,v)};put('w',String(state.window),'0');put('h',state.harness,'');put('t',state.tier,'');put('m',state.model,'');put('md',state.mode,'');put('g',state.granularity,'daily');put('from',state.start,firstDate);put('to',state.end,cutoffDate);put('measure',state.measure,'tokens');put('split',state.split,'none');put('stats',[...state.stats].join(','),'median,p95');put('cmp',state.compare,'model');put('stat',state.statistic,'median');put('sort',`${state.sort}:${state.dir}`,'cost:-1');
+function saveState(){const p=new URLSearchParams();const put=(k,v,d)=>{if(v!==d)p.set(k,v)};put('w',String(state.window),'0');put('h',state.harness,'');put('t',state.tier,'');put('m',state.model,'');put('md',state.mode,'');put('g',state.granularity,'daily');put('measure',state.measure,'tokens');put('split',state.split,'none');put('stats',[...state.stats].join(','),'median,p95');put('cmp',state.compare,'model');put('stat',state.statistic,'median');put('sort',`${state.sort}:${state.dir}`,'cost:-1');
     const hash=p.toString();try{history.replaceState(null,'',hash?'#'+hash:location.pathname+location.search)}catch(error){}}
 function loadState(){
     let p;try{p=new URLSearchParams(location.hash.slice(1))}catch(error){return}
     const w=Number(p.get('w'));if(Number.isInteger(w)&&w>=0&&w<data.windows.length)state.window=w;
     for(const [k,f] of [['h','harness'],['t','tier'],['m','model'],['md','mode']])if(p.get(k))state[f]=p.get(k);
     if(['hourly','daily','weekly','monthly'].includes(p.get('g')))state.granularity=p.get('g');
-    const valid=d=>/^\d{4}-\d{2}-\d{2}$/.test(d||'')&&d>=firstDate&&d<=cutoffDate;
-    if(valid(p.get('from')))state.start=p.get('from');if(valid(p.get('to')))state.end=p.get('to');if(state.start>state.end){state.start=firstDate;state.end=cutoffDate}
     if(['tokens','cost'].includes(p.get('measure')))state.measure=p.get('measure');
     if(['none','model','harness','tier','mode'].includes(p.get('split')))state.split=p.get('split');
     if(p.has('stats'))state.stats=new Set(p.get('stats').split(',').filter(s=>chartStats.some(([c])=>c===s)));
@@ -2705,15 +2703,6 @@ const syncCompare=()=>[...$('compare-dimension').children].forEach(b=>b.setAttri
 for(const [stat,label] of statDefs){const option=text('option',label);option.value=stat;$('comparison-stat-select').append(option)}
 $('comparison-stat-select').addEventListener('change',()=>{state.statistic=$('comparison-stat-select').value;if(data){comparison();saveState()}});
 $('split-select').addEventListener('change',()=>{state.split=$('split-select').value;if(data){usage();saveState()}});
-for(const id of ['trend-start','trend-end']){
-    $(id).addEventListener('change',()=>{
-        if(!data)return;
-        const start=$('trend-start'),end=$('trend-end'),error=$('trend-range-error');
-        error.hidden=start.validity.valid&&end.validity.valid&&start.value<=end.value;
-        if(!error.hidden){error.textContent=`Choose dates from ${firstDate} to ${cutoffDate}, with From on or before To.`;return}
-        state.start=start.value;state.end=end.value;usage();heatmap();performance(activeWindows()[state.window]);saveState();
-    });
-}
 $('granularity-select').addEventListener('change',()=>{state.granularity=$('granularity-select').value;if(data){usage();performance(activeWindows()[state.window]);saveState()}});
 $('expand-defs').addEventListener('click',()=>{const all=[...$('definitions').querySelectorAll('details')],open=!all.every(d=>d.open);all.forEach(d=>d.open=open);$('expand-defs').textContent=open?'Collapse all':'Expand all'});
 const themes=['system','light','dark'];let theme='system';try{theme=localStorage.getItem('harness-report-theme')||'system'}catch(error){}
@@ -2728,11 +2717,10 @@ async function start(){
         const notice=$('notice');notice.hidden=false;notice.replaceChildren(text('span','⚠'),text('span'));notice.lastChild.append(text('b','Unable to load the report. '),document.createTextNode(error.message||'Check that the local server is running.'));
         return;
     }
-    firstDate=data.first_date||data.trend_periods.daily[0].start.slice(0,10);cutoffDate=data.cutoff_date||data.generated.slice(0,10);state.start=firstDate;state.end=cutoffDate;
+    firstDate=data.first_date||data.trend_periods.daily[0].start.slice(0,10);cutoffDate=data.cutoff_date||data.generated.slice(0,10);
     // Models are ordered once by all-history tokens, so filters never repaint a model
     modelOrder=Object.entries(data.by_model).map(([name,ws])=>[name,Math.max(...ws.map(w=>w.total_tokens))]).filter(([,t])=>t>0).sort((a,b)=>b[1]-a[1]).map(([name])=>name);
     data.windows.forEach((w,i)=>{const b=text('button',w.label.replace(/^Last /,''));b.type='button';b.title=w.label;b.addEventListener('click',()=>{state.window=i;render()});$('tabs').append(b)});
-    for(const id of ['trend-start','trend-end']){$(id).min=firstDate;$(id).max=cutoffDate}
     $('subtitle').textContent=`${integer(data.files)} log files · ${integer(data.threads)} threads · ${data.timezone} · cutoff ${fmtTime(data.generated)}`;
     $('pricing-date').textContent=`Pricing verified ${data.pricing_date}`;
     table($('diagnostics'),['Diagnostic','Count'],Object.entries(data.quality).map(([k,v])=>[k,integer(v)]),{empty:'No parser issues recorded.'});data.warnings.forEach(w=>$('warnings').append(text('li',w)));
@@ -2741,7 +2729,7 @@ async function start(){
     $('sources').append(document.createTextNode(' · '));const modeLink=text('a','Fast mode documentation');modeLink.href='https://developers.openai.com/api/docs/guides/fast-mode';modeLink.rel='noreferrer';$('sources').append(modeLink);
     $('footer').textContent=`Report cutoff: ${fmtTime(data.generated)} (${data.timezone})`;
     loadState();
-    $('trend-start').value=state.start;$('trend-end').value=state.end;$('granularity-select').value=state.granularity;$('split-select').value=state.split;$('comparison-stat-select').value=state.statistic;
+    $('granularity-select').value=state.granularity;$('split-select').value=state.split;$('comparison-stat-select').value=state.statistic;
     [...$('trend-stat-options').querySelectorAll('input')].forEach(i=>{i.checked=state.stats.has(i.value)});
     syncMeasure();syncCompare();render();
 }
